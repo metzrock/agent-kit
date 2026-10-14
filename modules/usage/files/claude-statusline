@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/agent-kit-usage
+input=$(cat)
+jq -e 'type=="object"' <<<"$input" >/dev/null 2>&1 || exit 0
+mkdir -p "$cache"
+tmp=$(mktemp "$cache/status.XXXXXX")
+printf '%s\n' "$input" >"$tmp"
+mv "$tmp" "$cache/claude-statusline.json"
+jq -r '[.model.display_name // empty, (.workspace.current_dir // empty),
+  (.rate_limits.five_hour.used_percentage // empty | "5h \(floor)%"),
+  (.rate_limits.seven_day.used_percentage // empty | "wk \(floor)%")]|join(" · ")' <<<"$input"

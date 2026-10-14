@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# One workspace per project; keep running agents and split panes together.
+set -euo pipefail
+apply=0 close_empty=0
+for arg in "$@"; do
+  case "$arg" in --apply) apply=1 ;; --close-empty) close_empty=1 ;; --help|-h) echo 'herdr-tidy [--apply] [--close-empty]'; exit 0 ;; *) echo "Unknown option: $arg" >&2; exit 1 ;; esac
+done
+workspaces=$(herdr workspace list | jq '.result.workspaces')
+panes=$(herdr pane list | jq '.result.panes')
+enriched='[]' actions='[]'
+add_action() {
+  local description=$1; shift
+  local args; args=$(printf '%s\n' "$@" | jq -R . | jq -s .)
+  actions=$(jq --arg d "$description" --argjson a "$args" '.+[{description:$d,args:$a}]' <<<"$actions")
+}
+while IFS= read -r ws; do
+  id=$(jq -r .workspace_id <<<"$ws")
+  root=$(jq -r --arg id "$id" --argjson panes "$panes" '.worktree.repo_root // ([$panes[]|select(.workspace_id==$id)][0].cwd) // empty' <<<"$ws")
+  [[ -n $root ]] || continue
+  root=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$root")
+  enriched=$(jq --argjson w "$ws" --arg r "$root" '.+[$w+{root:$r}]' <<<"$enriched")
+done < <(jq -c '.[]|select((.label|startswith("crew:")|not) and (.worktree.is_linked_worktree!=true))' <<<"$workspaces")
+while IFS= read -r group; do
+  keep=$(jq -r '.[0].workspace_id' <<<"$group")
+  label=$(jq -r '.[0].label|gsub("_";" ")|gsub("[[:space:]]+";" ")|sub("^ +";"")|sub(" +$";"")' <<<"$group")
+  oldlabel=$(jq -r '.[0].label' <<<"$group")
+  [[ $label == "$oldlabel" ]] || add_action "rename workspace $oldlabel to $label" workspace rename "$keep" "$label"
+  while IFS= read -r ws; do
+    id=$(jq -r .workspace_id <<<"$ws")
+    while IFS= read -r tab; do
+      tid=$(jq -r .tab_id <<<"$tab"); name=$(jq -r '.label // ""' <<<"$tab")
+      live='[]'
+      while IFS= read -r pane; do
+        pid=$(jq -r .pane_id <<<"$pane")
+        if [[ $id != "$keep" && $(jq -r '.agent // ""' <<<"$pane") == '' ]]; then
+          info=$(herdr pane process-info --pane "$pid")
+          if jq -e '.result.process_info|.shell_pid!=null and .foreground_process_group_id==.shell_pid' <<<"$info" >/dev/null; then
+            if (( close_empty )); then add_action "close empty terminal $pid" pane close "$pid"; continue; fi
+            echo "note: empty terminal $pid will move too; --close-empty permits closing it"
+          fi
+        fi
+        live=$(jq --argjson p "$pane" '.+[$p]' <<<"$live")
+      done < <(jq -c --arg w "$id" --arg t "$tid" '.[]|select(.workspace_id==$w and .tab_id==$t)' <<<"$panes")
+      [[ $(jq length <<<"$live") != 0 ]] || continue
+      if [[ $name =~ ^[0-9]+$ || -z $name ]]; then
+        name=$(jq -r '[.[]|select(.agent!=null)|.terminal_title_stripped // empty|select(.!="claude" and .!="claude code" and .!="codex" and .!="")][0] // empty | .[0:32]' <<<"$live")
+        if [[ $id == "$keep" ]]; then
+          [[ -z $name ]] || add_action "name tab $tid $name" tab rename "$tid" "$name"
+          continue
+        fi
+        [[ -n $name ]] || name=$label
+      fi
+      [[ $id != "$keep" ]] || continue
+      first=$(jq -r '.[0].pane_id' <<<"$live")
+      add_action "move workspace $id into $label as tab $name" pane move "$first" --workspace "$keep" --new-tab --label "$name" --no-focus
+      while IFS= read -r pid; do add_action "keep split pane $pid together" follow "$pid"; done < <(jq -r '.[1:][].pane_id' <<<"$live")
+    done < <(herdr tab list --workspace "$id" | jq -c '.result.tabs[]')
+  done < <(jq -c '.[]' <<<"$group")
+done < <(jq -c 'group_by(.root)[]|sort_by((.worktree==null),.number)' <<<"$enriched")
+if [[ $(jq length <<<"$actions") == 0 ]]; then echo 'Herdr is already tidy: one workspace per project.'; exit 0; fi
+jq -r --arg p "$([[ $apply == 1 ]] || echo 'would ')" '.[]|$p+.description' <<<"$actions"
+(( apply )) || { echo 'nothing changed; run with --apply to do it'; exit 0; }
+new_tab=''
+while IFS= read -r action; do
+  args=()
+  while IFS= read -r arg; do args+=("$arg"); done < <(jq -r '.args[]' <<<"$action")
+  if [[ ${args[0]} == follow ]]; then
+    [[ -n $new_tab ]] || { echo 'Herdr did not return a created tab' >&2; exit 1; }
+    herdr pane move "${args[1]}" --tab "$new_tab" --split right --no-focus >/dev/null
+  else
+    result=$(herdr "${args[@]}")
+    created=$(jq -r '.result.move_result.created_tab.tab_id // empty' <<<"$result")
+    [[ -z $created ]] || new_tab=$created
+  fi
+done < <(jq -c '.[]' <<<"$actions")
+echo 'done'

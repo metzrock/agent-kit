@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [[ $local_sha =~ ^0+$ ]] && continue
+  "$(git rev-parse --show-toplevel)/tools/leak-check" --range "$remote_sha" "$local_sha"
+done

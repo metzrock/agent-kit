@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+output=$(mktemp)
+trap 'rm -f "$output"' EXIT
+if ! bats "${@:-tests}" >"$output" 2>&1; then sed '/^ok [0-9]/d; /^1[.][.][0-9]/d' "$output"; exit 1; fi

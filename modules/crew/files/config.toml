@@ -1,0 +1,28 @@
+# User-owned: updates propose changes instead of overwriting this file.
+onboarding = false
+[update]
+channel = "stable"
+[theme]
+name = "rose-pine"
+auto_switch = false
+[keys]
+prefix = "ctrl+b"
+focus_pane_left = "prefix+left"
+focus_pane_down = "prefix+down"
+focus_pane_up = "prefix+up"
+focus_pane_right = "prefix+right"
+navigate_pane_left = "left"
+navigate_pane_down = "down"
+navigate_pane_up = "up"
+navigate_pane_right = "right"
+split_horizontal = "prefix+minus"
+split_vertical = "prefix+v"
+[ui]
+mouse_capture = true
+agent_panel_sort = "spaces"
+mobile_width_threshold = 80
+window_title = "{workspace}: {tab}"
+status_indicators = "symbols"
+tab_bar_right = [{ type = "datetime", format = "%H:%M" }]
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["branch", "git_status"], [{ token = "$crew", fg = "#f6c177" }]]

@@ -1,0 +1,736 @@
+#!/usr/bin/env bash
+# herdr-crew: drive Codex implementers and a Sonnet helper (scout, reviewer, backup
+# coder) in sibling Herdr panes on behalf of an orchestrating agent (Claude Code /
+# Opus). One task at a time per Herdr workspace; each task gets its own git
+# worktree and branch.
+#
+#   herdr-crew task [--cloud] <slug>  new Herdr worktree workspace on branch crew/<slug>, agents in it;
+#                                     --cloud: the cloud lane (no local agents; every job below
+#                                     runs as a Claude Code cloud session, via cloud-run)
+#   herdr-crew scout [--model M] [--effort E] <brief>
+#                                     have Sonnet map the code for planning (brief: file or text);
+#                                     --model haiku runs this scout on Haiku 5.5 instead
+#   herdr-crew implement [--by sonnet|cloud] [--model sonnet|opus] <spec.md> [<spec-b.md>]
+#                                     hand the spec to the implementer and wait; with two specs a
+#                                     second Codex implementer builds part B in its own checkout,
+#                                     then part B is merged into the task worktree
+#   herdr-crew review [--by cloud]  have Sonnet (or a fresh Codex agent, high effort, or a
+#                                     fresh cloud session) review the diff
+#   herdr-crew fix [--by sonnet|cloud] <findings.md>
+#                                     hand review findings back to the implementer and wait
+#   herdr-crew merge                  retry merging part B into the task worktree
+#   herdr-crew diff [git-diff-args]   git diff of the task against its base (incl. untracked)
+#   herdr-crew commit <message>       commit everything in the task worktree
+#   herdr-crew finish                 stop the agents and end the task (branch + workspace kept)
+#   herdr-crew status                 task, agents, and diff stat
+#   herdr-crew up | down              start / close the agents without touching the task
+#   herdr-crew read <name> [lines]    dump an agent's recent terminal output
+#   herdr-crew step <text>            set the task's step shown in the Herdr sidebar ($crew)
+#
+# Reports are Markdown files; the path is printed on the last line.
+# Cloud lane: the task branch is pushed to origin (GitHub) and crew files travel in .cloud/
+# on it; the squashing commit at the end leaves .cloud/ out. CREW_CLOUD_MODEL (sonnet) is
+# the default cloud model, CREW_CLOUD_TIMEOUT (7200s) how long to wait for a report.
+# Env: CREW_IMPL_EFFORT (default medium), CREW_REVIEW_EFFORT (default high); for parallel
+# tasks from one lead, give each its own CREW_STATE_DIR and CREW_*_NAME agent names.
+# Exit codes: 0 ok, 3 agent blocked on a dialog, 4 agent settled without a report,
+# 5 usage limit reached (Codex, or Claude for Sonnet), 6 part B overlaps part A.
+set -euo pipefail
+
+config_implementer=sonnet
+if [[ -f $HOME/.config/agent-kit/config ]]; then
+  while IFS= read -r config_line || [[ -n $config_line ]]; do
+    case "$config_line" in CREW_IMPLEMENTER=*) config_implementer=${config_line#*=} ;; esac
+  done <"$HOME/.config/agent-kit/config"
+fi
+CREW_IMPLEMENTER=${CREW_IMPLEMENTER:-$config_implementer}
+case "$CREW_IMPLEMENTER" in sonnet|codex) ;; *) echo 'CREW_IMPLEMENTER must be sonnet or codex' >&2; exit 1 ;; esac
+# Reject unavailable lanes before contacting a running workspace.
+for arg in "$@"; do
+  if [[ $arg == --cloud || $arg == cloud ]]; then
+    command -v cloud-run >/dev/null || { echo 'Cloud lane unavailable: cloud-run is not on PATH' >&2; exit 1; }
+  fi
+done
+IMPL=${CREW_IMPL_NAME:-implementer}
+IMPL_B=${CREW_IMPL_B_NAME:-implementer-b}
+SONNET=${CREW_SONNET_NAME:-sonnet}
+# Codex reasoning effort for implementers (low|medium|high); never above high.
+IMPL_EFFORT=${CREW_IMPL_EFFORT:-medium}
+# Codex optional reviewer: a fresh agent each round, quit afterwards.
+REVIEWER=${CREW_REVIEWER_NAME:-reviewer}
+REVIEW_EFFORT=${CREW_REVIEW_EFFORT:-high}
+case "$IMPL_EFFORT $REVIEW_EFFORT" in *xhigh*|*max*) echo "herdr-crew: effort above high is not allowed" >&2; exit 1 ;; esac
+SONNET_MODEL=${CREW_SONNET_MODEL:-sonnet}
+SONNET_EFFORT=${CREW_SONNET_EFFORT:-medium}
+# Scouts can use Haiku for small mapping tasks.
+SCOUT_MODEL=${CREW_SCOUT_MODEL:-$SONNET_MODEL}
+SCOUT_EFFORT=${CREW_SCOUT_EFFORT:-$SONNET_EFFORT}
+TIMEOUT_MS=${CREW_TIMEOUT_MS:-3600000}
+WORKTREE_ROOT=${CREW_WORKTREE_ROOT:-$HOME/.local/share/herdr-crew/worktrees}
+CLOUD_MODEL=${CREW_CLOUD_MODEL:-sonnet}
+CLOUD_TIMEOUT=${CREW_CLOUD_TIMEOUT:-7200}
+
+die() { printf 'herdr-crew: %s\n' "$*" >&2; exit 1; }
+
+[ "${HERDR_ENV:-}" = 1 ] || die "not running inside a Herdr pane"
+command -v jq >/dev/null || die "jq is required"
+
+STATE_DIR=${CREW_STATE_DIR:-$HOME/.local/state/herdr-crew/${HERDR_WORKSPACE_ID:-default}}
+mkdir -p "$STATE_DIR"
+PANES_FILE=$STATE_DIR/panes
+TASK_FILE=$STATE_DIR/task.env
+
+# Task state: WORKTREE BRANCH BASE REPO RUN, the task's Herdr workspace and root pane, and
+# for the cloud lane the implementing cloud session (fix rounds go back to it).
+WORKTREE="" BRANCH="" BASE="" REPO="" RUN="" TASK_WS="" TASK_PANE="" LANE="" CLOUD_SESSION="" CLOUD_URL=""
+# shellcheck disable=SC1090
+[ -f "$TASK_FILE" ] && . "$TASK_FILE"
+# Part B's checkout (detached, no branch), only while two implementers are working.
+WORKTREE_B=${WORKTREE:+$WORKTREE-b}
+
+# Sonnet's standing orders, on top of the user's normal Claude Code setup.
+SONNET_ROLE="You are the Sonnet helper in herdr-crew, an automated coding crew driven by a script; Opus orchestrates and reads only your reports. Do exactly the job in each prompt, write the requested report file, then reply only with its path. Never ask questions (nobody is watching): make reasonable assumptions and list them in the report. Do not commit, do not touch anything outside the current checkout except the report file."
+
+# Show the task's current step in the sidebar ($crew token on the task workspace).
+step() {
+  [ -n "$TASK_WS" ] && [ -n "$*" ] || return 0
+  herdr workspace report-metadata "$TASK_WS" --source herdr-crew --token crew="$*" >/dev/null 2>&1 || true
+}
+
+need_task() { [ -n "$WORKTREE" ] || die "no active task; start one with: herdr-crew task <slug>"; }
+
+agent_live() { herdr agent get "$1" >/dev/null 2>&1; }
+
+agent_field() { # <name> <field>; empty when the agent is gone
+  herdr agent get "$1" 2>/dev/null | jq -r ".result.agent.$2 // empty" || true
+}
+
+split_pane() { # <target-pane> <direction> <cwd>
+  herdr pane split "$1" --direction "$2" --cwd "$3" --no-focus | jq -r '.result.pane.pane_id'
+}
+
+start_agent() { # <kind> <name> <pane> <cwd> <agent args...>
+  local kind=$1 name=$2 pane=$3 cwd=$4 root screen; shift 4
+  # Both Codex and Claude key folder trust by the main repository root, even inside a worktree.
+  root=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    root=$(dirname "$root") || root=$cwd
+  if ! herdr agent start "$name" --kind "$kind" --pane "$pane" --timeout 60000 -- "$@" >/dev/null; then
+    screen=$(herdr pane read "$pane" --source visible 2>/dev/null || true)
+    if grep -q 'Yes, I trust this folder' <<<"$screen"; then
+      die "$name is asking Claude Code to trust $root in pane $pane; answer it there (or open Claude in $root once), then run: herdr-crew up"
+    fi
+    echo "--- $name did not become ready; screen follows ---" >&2
+    printf '%s\n' "$screen" | tail -40 >&2
+    die "$name failed to start (a trust or login dialog may need answering in pane $pane)"
+  fi
+  # Codex's login and folder-trust screens are detected as idle, so check explicitly.
+  screen=$(herdr pane read "$pane" --source visible)
+  if grep -q 'Sign in with ChatGPT' <<<"$screen"; then
+    die "$name is at the Codex login screen; sign in in pane $pane, then run: herdr-crew down && herdr-crew up"
+  fi
+  if grep -q 'Trust this folder' <<<"$screen"; then
+    die "$name is asking to trust $root in pane $pane; answer it there, then run: herdr-crew up"
+  fi
+  # Show the role instead of "codex"/"claude" in the sidebar.
+  herdr pane report-metadata "$pane" --source herdr-crew --agent "$kind" --display-agent "$name" >/dev/null 2>&1 || true
+}
+
+pane_exists() { herdr pane get "$1" >/dev/null 2>&1; }
+
+# Quit an agent but keep its shell. Idle Codex quits on one ctrl+c, so a second is
+# sent only if it is still running (otherwise the key lands in the shell as junk);
+# Claude Code needs two presses in a row.
+quit_agent() { # <name>; fails if the agent is still running
+  local n=$1 kind _i
+  kind=$(agent_field "$n" agent)
+  [ -n "$kind" ] || return 0
+  for _i in 1 2; do
+    if [ "$kind" = claude ]; then herdr agent send-keys "$n" ctrl+c ctrl+c >/dev/null 2>&1 || true
+    else herdr agent send-keys "$n" ctrl+c >/dev/null 2>&1 || true; fi
+    for _ in 1 2 3 4 5; do agent_live "$n" || return 0; sleep 1; done
+  done
+  return 1
+}
+
+# CREW_AGENT tells the usage hooks (prompt-clock, usage-watch) this is a crew agent.
+start_sonnet() { # <pane> <cwd> [model] [effort]
+  local model effort=${4:-$SONNET_EFFORT}
+  model=$(model_id "${3:-$SONNET_MODEL}")
+  start_agent claude "$SONNET" "$1" "$2" --model "$model" --effort "$effort" \
+    --permission-mode auto --add-dir "$STATE_DIR" --disallowedTools Agent \
+    --settings '{"env":{"CREW_AGENT":"sonnet"}}' \
+    --append-system-prompt "$SONNET_ROLE" -n "crew $SONNET"
+  echo "$model $effort" >"$STATE_DIR/sonnet-model"
+}
+
+model_id() { [ "$1" = haiku ] && echo claude-haiku-5-5 || echo "$1"; }
+
+# Give Sonnet a clean context for a new job (scout notes don't belong in a review).
+# If it's on another model or effort than the job wants (e.g. after a Haiku scout),
+# restart it on the right one instead, which is a clean context too.
+sonnet_fresh() { # [model] [effort]
+  local want have pane cwd
+  want="$(model_id "${1:-$SONNET_MODEL}") ${2:-$SONNET_EFFORT}"
+  have=$(cat "$STATE_DIR/sonnet-model" 2>/dev/null || echo "$(model_id "$SONNET_MODEL") $SONNET_EFFORT")
+  if [ "$want" != "$have" ] && agent_live "$SONNET"; then
+    pane=$(agent_field "$SONNET" pane_id); cwd=$(agent_field "$SONNET" cwd)
+    quit_agent "$SONNET" || die "$SONNET did not exit to switch model; close it in pane $pane"
+    start_sonnet "$pane" "$cwd" "${want% *}" "${want#* }"
+    return 0
+  fi
+  # /clear never shows as "working", so --wait would report a stall.
+  herdr agent prompt "$SONNET" "/clear" >/dev/null 2>&1 || true
+  sleep 2
+}
+
+cmd_up() {
+  if cloud_on; then echo "cloud lane: no local agents"; cmd_status; return; fi
+  local cwd=${WORKTREE:-$PWD} impl_pane son_pane width n live_cwd
+  for n in "$IMPL" "$SONNET"; do
+    live_cwd=$(agent_field "$n" cwd)
+    if [ -n "$live_cwd" ] && [ "$live_cwd" != "$cwd" ]; then
+      die "$n is running in $live_cwd, not $cwd; run 'herdr-crew down' first"
+    fi
+  done
+  if ! agent_live "$IMPL"; then
+    if [ -n "$TASK_PANE" ] && pane_exists "$TASK_PANE"; then
+      impl_pane=$TASK_PANE # the task workspace's own shell pane
+    else
+      width=$(herdr pane layout --pane "$HERDR_PANE_ID" | jq --arg p "$HERDR_PANE_ID" -r '.result.layout.panes[] | select(.pane_id == $p) | .rect.width')
+      if [ "${width:-0}" -ge 120 ]; then impl_pane=$(split_pane "$HERDR_PANE_ID" right "$cwd")
+      else impl_pane=$(split_pane "$HERDR_PANE_ID" down "$cwd"); fi
+      echo "$impl_pane" >>"$PANES_FILE"
+    fi
+    if [[ $CREW_IMPLEMENTER == sonnet ]]; then
+      start_agent claude "$IMPL" "$impl_pane" "$cwd" --model sonnet --effort medium \
+        --add-dir "$STATE_DIR" --settings '{"env":{"CREW_AGENT":"implementer"}}' \
+        --append-system-prompt 'Implement the supplied spec. Never commit or push unless explicitly asked. Report conflicts to the lead.'
+    else
+      start_agent codex "$IMPL" "$impl_pane" "$cwd" -c "model_reasoning_effort=\"$IMPL_EFFORT\"" \
+        --sandbox workspace-write
+    fi
+  fi
+  if ! agent_live "$SONNET"; then
+    impl_pane=$(agent_field "$IMPL" pane_id)
+    son_pane=$(split_pane "$impl_pane" down "$cwd")
+    echo "$son_pane" >>"$PANES_FILE"
+    start_sonnet "$son_pane" "$cwd"
+  fi
+  # Part B was mid-flight when the agents went down: bring its implementer back too.
+  if [ -n "$WORKTREE_B" ] && [ -d "$WORKTREE_B" ]; then up_b; fi
+  cmd_status
+}
+
+# Second implementer in its own detached checkout, so the two never see each other's
+# half-done files or trip over each other's test runs.
+up_b() {
+  local live_cwd b_pane
+  live_cwd=$(agent_field "$IMPL_B" cwd)
+  if [ -n "$live_cwd" ]; then
+    [ "$live_cwd" = "$WORKTREE_B" ] && return 0
+    die "$IMPL_B is running in $live_cwd, not $WORKTREE_B; run 'herdr-crew down' first"
+  fi
+  [ -d "$WORKTREE_B" ] || git -C "$REPO" worktree add -q --detach "$WORKTREE_B" "$BASE"
+  b_pane=$(agent_field "$SONNET" pane_id); [ -n "$b_pane" ] || b_pane=$(agent_field "$IMPL" pane_id)
+  b_pane=$(split_pane "$b_pane" right "$WORKTREE_B")
+  echo "$b_pane" >>"$PANES_FILE"
+  start_agent codex "$IMPL_B" "$b_pane" "$WORKTREE_B" -c "model_reasoning_effort=\"$IMPL_EFFORT\"" --sandbox workspace-write
+}
+
+cmd_down() {
+  # The task's root pane belongs to its workspace: quit Codex there but keep the shell.
+  if [ -n "$TASK_PANE" ] && [ "$(agent_field "$IMPL" pane_id)" = "$TASK_PANE" ]; then
+    quit_agent "$IMPL" || echo "warning: $IMPL did not exit; close it in pane $TASK_PANE" >&2
+  fi
+  # Agents left running by an earlier, finished task live in another workspace that
+  # PANES_FILE no longer lists. Quit any crew agent outside the current task.
+  local n live_cwd want
+  for n in "$IMPL" "$IMPL_B" "$SONNET"; do
+    live_cwd=$(agent_field "$n" cwd)
+    [ -n "$live_cwd" ] || continue
+    want=$WORKTREE; [ "$n" = "$IMPL_B" ] && want=$WORKTREE_B
+    [ -n "$want" ] && [ "$live_cwd" = "$want" ] && continue
+    if quit_agent "$n"; then echo "stopped stale $n ($live_cwd)"
+    else echo "warning: stale $n in $live_cwd did not exit" >&2; fi
+  done
+  [ -f "$PANES_FILE" ] || return 0
+  while read -r p; do
+    [ -n "$p" ] && herdr pane close "$p" >/dev/null 2>&1 && echo "closed $p"
+  done <"$PANES_FILE"
+  rm -f "$PANES_FILE"
+}
+
+save_task() {
+  printf 'WORKTREE=%q\nBRANCH=%q\nBASE=%q\nREPO=%q\nRUN=%q\nTASK_WS=%q\nTASK_PANE=%q\nLANE=%q\nCLOUD_SESSION=%q\nCLOUD_URL=%q\n' \
+    "$WORKTREE" "$BRANCH" "$BASE" "$REPO" "$RUN" "$TASK_WS" "$TASK_PANE" "$LANE" "$CLOUD_SESSION" "$CLOUD_URL" >"$TASK_FILE"
+}
+
+task_usage_snapshot() {
+  jq -r '[.rate_limits.five_hour.used_percentage // "-", .rate_limits.five_hour.resets_at // "-"]|map(tostring)|join("\t")' \
+    "${XDG_CACHE_HOME:-$HOME/.cache}/agent-kit-usage/claude-statusline.json" 2>/dev/null || printf '%s\t%s\n' - -
+}
+
+cmd_task() {
+  local lane=local
+  if [ "${1:-}" = --cloud ]; then lane=cloud; shift; fi
+  local slug=${1:-}
+  [[ $slug =~ ^[a-z0-9][a-z0-9._-]{0,40}$ ]] || die "usage: herdr-crew task [--cloud] <slug>  (lowercase, digits, . _ -)"
+  [ -z "$WORKTREE" ] || die "task $BRANCH is still active in $WORKTREE; run 'herdr-crew finish' first"
+  local repo; repo=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+  git -C "$repo" rev-parse --verify -q HEAD >/dev/null || die "repository has no commits yet"
+  git -C "$repo" show-ref --verify -q "refs/heads/crew/$slug" && die "branch crew/$slug already exists"
+  if [ "$lane" = cloud ]; then
+    [[ $(git -C "$repo" remote get-url origin 2>/dev/null) == *github.com* ]] ||
+      die "the cloud lane needs the repo on GitHub (origin); use a local task instead"
+    cloud-run check || die "cloud lane is unavailable; use a local task"
+  fi
+  if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+    echo "note: uncommitted changes in $repo are NOT included in the task worktree" >&2
+  fi
+  WORKTREE=$WORKTREE_ROOT/$(basename "$repo")-$slug
+  WORKTREE_B=$WORKTREE-b
+  BRANCH=crew/$slug
+  BASE=$(git -C "$repo" rev-parse HEAD)
+  REPO=$repo
+  RUN=$STATE_DIR/runs/$(basename "$repo")-$slug-$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$WORKTREE_ROOT" "$RUN"
+  cmd_down >/dev/null # agents from a previous task, if any
+  # A Herdr worktree gets its own workspace, grouped under the repo in the sidebar.
+  local created
+  created=$(herdr worktree create --cwd "$repo" --branch "$BRANCH" --base "$BASE" \
+    --path "$WORKTREE" --label "crew: $slug" --no-focus) || die "herdr worktree create failed"
+  TASK_WS=$(jq -r '.result.workspace.workspace_id' <<<"$created")
+  TASK_PANE=$(jq -r '.result.root_pane.pane_id' <<<"$created")
+  LANE=$lane CLOUD_SESSION="" CLOUD_URL=""
+  save_task
+  task_usage_snapshot >"$RUN/usage-start.tsv"
+  step "starting"
+  cmd_up
+  step "ready"
+}
+
+usage_limit_line() { # <name>; prints nothing (and succeeds) when there is no limit message
+  { herdr agent read "$1" --source recent-unwrapped --lines 60 2>/dev/null || true; } |
+    { grep -iE 'hit your (usage |session |weekly )?limit|usage limit reached' || true; } | tail -1
+}
+
+# Submit a prompt, wait for the agent to settle, and verify it wrote $report.
+# Empty step texts leave the sidebar alone (used when two agents run at once).
+prompt_and_wait() { # <name> <report-path> <step-while-working> <step-when-done> <prompt>
+  local name=$1 report=$2 doing=$3 done_step=$4 prompt=$5 out status limit
+  agent_live "$name" || die "$name is not running; run: herdr-crew up"
+  step "$doing"
+  if ! out=$(herdr agent prompt "$name" "$prompt" --wait --timeout "$TIMEOUT_MS" 2>&1); then
+    printf '%s\n' "$out" >&2
+    step "stalled: $name"
+    die "$name wait failed; inspect with: herdr-crew read $name (do not resubmit blindly)"
+  fi
+  status=$(printf '%s\n' "$out" | jq -r '.result.agent.agent_status' 2>/dev/null || echo unknown)
+  if [ "$status" = blocked ]; then
+    step "blocked: $name needs you"
+    echo "--- $name is blocked on a dialog ---" >&2
+    herdr agent read "$name" --source recent-unwrapped --lines 60 >&2 || true
+    exit 3
+  fi
+  if [ ! -s "$report" ]; then
+    limit=$(usage_limit_line "$name")
+    if [ -n "$limit" ]; then
+      printf 'USAGE LIMIT (%s): %s\n' "$name" "$limit" >&2
+      step "usage limit${limit:+: }$(grep -oiE '(try again (at|in)|resets?( at)?) [^.·]+' <<<"$limit" | head -1)"
+      exit 5
+    fi
+    step "stalled: $name wrote no report"
+    echo "--- $name settled ($status) without writing $report ---" >&2
+    herdr agent read "$name" --source recent-unwrapped --lines 80 >&2 || true
+    exit 4
+  fi
+  step "$done_step"
+  cat "$report"
+  printf '\nREPORT: %s\n' "$report"
+}
+
+next_path() { # <dir> <stem>; <stem>.md, then <stem>-2.md, ...
+  local n=2 p=$1/$2.md
+  while [ -e "$p" ]; do p=$1/$2-$n.md; n=$((n + 1)); done
+  printf '%s\n' "$p"
+}
+
+TEST_BUDGET="Testing: add tests for non-trivial logic (skip glue, config, and UI wiring). Use the project's existing test setup; if it has none, use the language's built-in test tooling (e.g. unittest, node:test, go test) and add no new dependencies. Test budget: while working, run only the test files you added or changed; run the full suite once, at the end. Use quiet output (e.g. unittest -q, pytest -q) so only failures print. No browser or visual checks unless the spec asks for them. Report the exact test commands and results."
+TEST_POLICY="$TEST_BUDGET When a command takes more than a few seconds, wait for it in a single call with a long yield (e.g. yield_time_ms 300000) instead of polling it repeatedly. If the tests need local sockets or servers and the sandbox blocks them, request escalation on the first run instead of running them sandboxed first."
+
+impl_prompt() { # <spec> <dir> <report> [part-note]
+  printf '%s' "Implement the task specified in $1 (read it fully first). ${4:-}Work only in the current directory ($2); it may already hold partial work from an earlier attempt, so build on it. $TEST_POLICY Run any relevant build or lint. Do not commit. When finished, write a concise Markdown report to $3: files changed, what you did, test commands with results, and anything left undone or uncertain. Then reply only with the report path."
+}
+
+cmd_implement() {
+  need_task
+  local by=$CREW_IMPLEMENTER model=$CLOUD_MODEL
+  cloud_on && by=cloud
+  cloud_on && by=cloud
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by) by=${2:-}; shift 2 || true ;;
+      --model) model=${2:?--model takes sonnet or opus}; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  case "$by" in codex|sonnet|cloud) ;; *) die "--by takes codex, sonnet or cloud" ;; esac
+  [[ $by != codex || $CREW_IMPLEMENTER == codex ]] || die 'Set CREW_IMPLEMENTER=codex to use a Codex implementer'
+  local spec=${1:-} spec_b=${2:-}
+  [ -f "$spec" ] || die "usage: herdr-crew implement [--by sonnet|cloud] [--model sonnet|opus] <spec.md> [<spec-b.md>]"
+  if [[ -n $spec_b && ( $CREW_IMPLEMENTER != codex || $by != codex ) ]]; then
+    die 'Two-part implementation requires CREW_IMPLEMENTER=codex; Sonnet accepts one spec.'
+  fi
+  cp "$spec" "$RUN/spec.md"
+  if [ "$by" = cloud ]; then
+    [ -z "$spec_b" ] || die "the cloud lane takes one spec"
+    to_cloud
+    local report; report=$(next_path "$RUN" implementation)
+    cloud_put "$RUN/spec.md" spec.md
+    cloud_job new impl "$model" "$(basename "$report" .md)" "cloud: implementing ($model)" "implemented, checking" \
+"Implement the task specified in .cloud/spec.md (read it fully first). The branch may already hold partial work from an earlier attempt; build on it. $TEST_BUDGET Run any relevant build or lint. Commit the code changes. The report covers: files changed, what you did, test commands with results, assumptions, and anything left undone or uncertain."
+    return
+  fi
+  if [ -z "$spec_b" ]; then
+    local agent=$IMPL report
+    if [ "$by" = sonnet ] && [ "$CREW_IMPLEMENTER" != sonnet ]; then agent=$SONNET; sonnet_fresh; fi
+    report=$(next_path "$RUN" implementation)
+    prompt_and_wait "$agent" "$report" "implementing ($by)" "implemented, checking" \
+      "$(impl_prompt "$RUN/spec.md" "$WORKTREE" "$report")"
+    return
+  fi
+  [ "$by" = codex ] || die "two parts always go to two Codex implementers"
+  [ -f "$spec_b" ] || die "part B spec not found: $spec_b"
+  cp "$spec_b" "$RUN/spec-b.md"
+  step "starting implementer-b"
+  up_b
+  local note="Another implementer is building a different part of the same task at the same time, in a separate checkout; change only the files your spec assigns to you. "
+  local ra=0 rb=0 rep_a rep_b
+  rep_a=$(next_path "$RUN" implementation); rep_b=$(next_path "$RUN" implementation-b)
+  step "implementing ×2"
+  ( prompt_and_wait "$IMPL" "$rep_a" "" "" \
+      "$(impl_prompt "$RUN/spec.md" "$WORKTREE" "$rep_a" "$note")" ) >"$RUN/.out-a" 2>&1 &
+  local pa=$!
+  ( prompt_and_wait "$IMPL_B" "$rep_b" "" "" \
+      "$(impl_prompt "$RUN/spec-b.md" "$WORKTREE_B" "$rep_b" "$note")" ) >"$RUN/.out-b" 2>&1 &
+  local pb=$!
+  wait "$pa" || ra=$?
+  wait "$pb" || rb=$?
+  printf '=== part A (%s, exit %s) ===\n' "$IMPL" "$ra"; cat "$RUN/.out-a"
+  printf '\n=== part B (%s, exit %s) ===\n' "$IMPL_B" "$rb"; cat "$RUN/.out-b"
+  rm -f "$RUN/.out-a" "$RUN/.out-b"
+  # Keep part B's work even after a usage limit, so a WIP commit captures it.
+  if [ "$rb" = 0 ] || [ "$rb" = 5 ]; then printf '\n'; cmd_merge || exit $?; fi
+  local rc
+  for rc in 5 3 4; do
+    if [ "$ra" = "$rc" ] || [ "$rb" = "$rc" ]; then exit "$rc"; fi
+  done
+  [ "$ra" = 0 ] && [ "$rb" = 0 ] || exit 1
+  step "implemented, checking"
+}
+
+# Copy part B's changes into the task worktree and retire its checkout and agent.
+# The patch is kept in the reports dir either way, so nothing is lost on a conflict.
+cmd_merge() {
+  need_task
+  [ -d "$WORKTREE_B" ] || { echo "no part B checkout to merge"; return 0; }
+  local patch=$RUN/part-b.patch pane
+  local newfile
+  while IFS= read -r -d '' newfile; do git -C "$WORKTREE_B" add -N -- "$newfile"; done < <(git -C "$WORKTREE_B" ls-files -o --exclude-standard -z)
+  git -C "$WORKTREE_B" diff --binary "$BASE" >"$patch"
+  local ok=1
+  if [ -s "$patch" ] && ! git -C "$WORKTREE" apply --binary --check "$patch" 2>"$RUN/.apply-err"; then ok=0; fi
+  pane=$(agent_field "$IMPL_B" pane_id)
+  quit_agent "$IMPL_B" || true
+  [ -n "$pane" ] && herdr pane close "$pane" >/dev/null 2>&1 || true
+  git -C "$REPO" worktree remove --force "$WORKTREE_B"
+  if [ "$ok" = 0 ]; then
+    step "blocked: parts overlap"
+    cat "$RUN/.apply-err" >&2
+    echo "part B overlaps part A and was NOT merged; its changes are saved in $patch" >&2
+    exit 6
+  fi
+  rm -f "$RUN/.apply-err"
+  if [ -s "$patch" ]; then
+    git -C "$WORKTREE" apply --binary "$patch"
+    echo "merged part B ($(grep -c '^diff --git' "$patch") files) into $WORKTREE"
+  else
+    echo "part B made no changes"
+  fi
+}
+
+cmd_fix() {
+  need_task
+  local agent=$IMPL by=$CREW_IMPLEMENTER
+  if [ "${1:-}" = --by ]; then by=${2:-}; shift 2 || true; fi
+  cloud_on && by=cloud
+  case "$by" in codex) ;; sonnet) [[ $CREW_IMPLEMENTER == sonnet ]] || agent=$SONNET ;; cloud) ;; *) die "--by takes codex, sonnet or cloud" ;; esac
+  [[ $by != codex || $CREW_IMPLEMENTER == codex ]] || die 'Set CREW_IMPLEMENTER=codex to use a Codex implementer'
+  local findings=${1:-}; [ -f "$findings" ] || die "usage: herdr-crew fix [--by sonnet|cloud] <findings.md>"
+  local n=1; while [ -e "$RUN/fix-$n.md" ] || [ -e "$RUN/findings-$n.md" ]; do n=$((n + 1)); done
+  cp "$findings" "$RUN/findings-$n.md"
+  if [ "$by" = cloud ]; then
+    to_cloud
+    cloud_put "$RUN/findings-$n.md" "findings-$n.md"
+    cloud_job follow-up fix "$CLOUD_MODEL" "fix-$n" "cloud: fix round $n" "fixed, re-checking" \
+"First run: git pull origin $BRANCH (the crew pushed code review findings to .cloud/findings-$n.md). Fix every MUST-FIX; for the rest use judgment and say what you decided. Re-run only the tests related to the fixes, then the full suite once at the end. Commit the fixes. The report lists each finding and how it was resolved, plus test results."
+    return
+  fi
+  prompt_and_wait "$agent" "$RUN/fix-$n.md" "fix round $n ($by)" "fixed, re-checking" \
+"Code review findings for this change are in $RUN/findings-$n.md. Work in $WORKTREE. Fix every MUST-FIX; for the rest use judgment and say what you decided. Re-run only the tests related to the fixes, then the full suite once at the end, waiting for long commands in a single call. Do not commit. Write a concise Markdown report to $RUN/fix-$n.md listing each finding and how it was resolved, plus test results. Then reply only with the report path."
+}
+
+cmd_scout() {
+  need_task
+  local model=$SCOUT_MODEL effort=$SCOUT_EFFORT
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) model=${2:?--model needs a value}; shift 2 ;;
+      --effort) effort=${2:?--effort needs a value}; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  local brief=${1:-}
+  [ -n "$brief" ] || die "usage: herdr-crew scout [--model M] [--effort E] <brief.md | \"what to look into\">"
+  local stem=scout; [ "$model" = "$SONNET_MODEL" ] || stem=scout-$model
+  local report; report=$(next_path "$RUN" "$stem")
+  if [ -f "$brief" ]; then cp "$brief" "${report%.md}-brief.md"
+  else printf '%s\n' "$*" >"${report%.md}-brief.md"; fi
+  local name; name=$(basename "$report" .md)
+  if cloud_on; then
+    cloud_put "${report%.md}-brief.md" "$name-brief.md"
+    cloud_job new scout "$CLOUD_MODEL" "$name" "cloud: scouting" "scouted, planning" \
+      "$(scout_prompt ".cloud/$name-brief.md" ".cloud/$name.md") Do NOT modify any repository files other than the report."
+    return
+  fi
+  sonnet_fresh "$model" "$effort"
+  prompt_and_wait "$SONNET" "$report" "scouting ($model)" "scouted, planning" \
+    "$(scout_prompt "${report%.md}-brief.md" "$report") Do NOT modify any files. Then reply only with the report path."
+}
+
+scout_prompt() { # <brief-path> <report-path>
+  printf '%s' \
+"Opus is planning a coding task in this repo and will not read the code itself, so it relies on your map. The task brief is in $1. Read only what you need. Write a Markdown report to $2, at most about 100 lines, with these sections: Relevant code (each file and function with file:line and a one-line purpose); How it fits together (data flow, call paths, existing patterns to follow); Tests (where they live, the exact commands to run them; do NOT run the tests yourself); Constraints and gotchas (conventions, config, anything easy to break); Risk (does it touch auth, secrets, data deletion or migration, concurrency, or network-exposed services); Size (rough lines changed and number of files); Split (can the work be built as two parts that change no file in common, tests included, with neither part needing code the other is still writing? If yes, list each part's files; if no, say why). Quote code only in short snippets."
+}
+
+cmd_review() {
+  need_task
+  local by=sonnet
+  cloud_on && by=cloud
+  case "${1:-}" in --by) by=${2:?--by takes sonnet, codex or cloud} ;; "") ;; *) die "usage: herdr-crew review [--by cloud]" ;; esac
+  case "$by" in sonnet|codex|cloud) ;; *) die "--by takes sonnet, codex or cloud" ;; esac
+  local n=1; while [ -e "$RUN/review-$n.md" ]; do n=$((n + 1)); done
+  local where=$RUN; [ "$by" = cloud ] && where=.cloud
+  local earlier=""
+  [ "$n" -gt 1 ] && earlier="This is review round $n: earlier reviews, findings and fix reports (review-*.md, findings-*.md, fix-*.md) are in $where; confirm each earlier MUST-FIX is really fixed and the fixes broke nothing, then review the rest of the diff as usual. "
+  if [ "$by" = cloud ]; then
+    to_cloud
+    # A new session each round: a reviewer shouldn't remember writing this code.
+    cloud_job new review "${CREW_CLOUD_REVIEW_MODEL:-sonnet}" "review-$n" "cloud: review" "reviewed, deciding" \
+"$(review_prompt "$n" "$earlier" "Review the changes on this branch against commit $BASE (git diff $BASE -- . ':(exclude).cloud'). The spec is in .cloud/spec*.md and the implementer reports in .cloud/implementation*.md;" ".cloud/review-$n.md") Do not commit anything except the report."
+    return
+  fi
+  local agent=$SONNET label="Sonnet review" pane rc=0
+  if [ "$by" = codex ]; then
+    # Fresh context: a new Codex agent in its own pane, closed again after the review.
+    agent=$REVIEWER label="Codex review"
+    if ! agent_live "$REVIEWER"; then
+      pane=$(split_pane "$(agent_field "$IMPL" pane_id)" down "$WORKTREE")
+      echo "$pane" >>"$PANES_FILE"
+      start_agent codex "$REVIEWER" "$pane" "$WORKTREE" -c "model_reasoning_effort=\"$REVIEW_EFFORT\"" --sandbox workspace-write
+    fi
+  else
+    # Fresh context: a reviewer shouldn't remember scouting or writing this code.
+    sonnet_fresh
+  fi
+  review_prompt "$n" "$earlier" "Review the changes in $WORKTREE against commit $BASE (git diff $BASE, plus git status for untracked files). The spec is in $RUN/spec*.md and the implementer reports in $RUN/implementation*.md;" "$RUN/review-$n.md" >"$RUN/.review-prompt"
+  printf ' Then reply only with the report path.' >>"$RUN/.review-prompt"
+  ( prompt_and_wait "$agent" "$RUN/review-$n.md" "$label" "reviewed, deciding" "$(cat "$RUN/.review-prompt")" ) || rc=$?
+  if [ "$by" = codex ]; then
+    pane=$(agent_field "$REVIEWER" pane_id)
+    quit_agent "$REVIEWER" || true
+    [ -z "$pane" ] || herdr pane close "$pane" >/dev/null 2>&1 || true
+  fi
+  return "$rc"
+}
+
+review_prompt() { # <round> <earlier-text> <what-to-review> <report-path>
+  local n=$1 earlier=$2 what=$3 report=$4
+  printf '%s' \
+"$what check the change actually satisfies the spec. ${earlier}Do NOT modify any files in the repository (the report is the only file you write). Run the tests. Look for correctness bugs, missed edge cases, broken error handling, security problems, missing tests for non-trivial logic, and needless complexity. Verify each finding against the surrounding code before reporting it; report only real problems. Opus will decide from your report alone without reading the code, so make each finding self-contained. Write a concise Markdown report to $report: first a short summary (does it meet the spec, test commands and results, risky areas you checked); then one short section per finding with severity (MUST-FIX, SHOULD-FIX, NIT), confidence (high/medium), file:line, a code excerpt of at most 6 lines, the problem, a concrete failure scenario, and a suggested fix. End with a one-line verdict: APPROVE or CHANGES-REQUESTED."
+}
+
+# Mark untracked files intent-to-add so they appear in diffs without staging content.
+show_untracked() {
+  local newfile
+  while IFS= read -r -d '' newfile; do git -C "$WORKTREE" add -N -- "$newfile"; done < <(git -C "$WORKTREE" ls-files -o --exclude-standard -z)
+}
+
+cmd_diff() {
+  need_task
+  show_untracked
+  git -C "$WORKTREE" diff "$BASE" "$@"
+}
+
+cmd_commit() {
+  need_task
+  [ $# -gt 0 ] || die "usage: herdr-crew commit <message>"
+  case "$*" in wip:*) ;; *) cloud_on && cloud_squash ;; esac
+  # Stage explicit paths with real changes only: files whose only change is line
+  # endings (CRLF written by Windows tools) are left out, as repo rules often require.
+  # (--name-only ignores --ignore-cr-at-eol, so check each file's diff instead.)
+  local files=() crlf_only=() f
+  while IFS= read -r -d '' f; do
+    if git -C "$WORKTREE" diff --quiet --ignore-cr-at-eol HEAD -- "$f"; then crlf_only+=("$f")
+    else files+=("$f"); fi
+  done < <(git -C "$WORKTREE" diff --name-only -z HEAD)
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(git -C "$WORKTREE" ls-files -o --exclude-standard -z)
+  [ ${#crlf_only[@]} -eq 0 ] || printf 'skipped (line-ending changes only): %s\n' "${crlf_only[*]}" >&2
+  [ ${#files[@]} -gt 0 ] || { echo "nothing to commit"; return; }
+  git -C "$WORKTREE" add -- "${files[@]}"
+  if git -C "$WORKTREE" diff --cached --quiet; then echo "nothing to commit"; return; fi
+  git -C "$WORKTREE" commit -q -m "$*"
+  case "$*" in wip:*) ;; *) step "committed" ;; esac
+  git -C "$WORKTREE" log -1 --format='committed %h on %D: %s'
+}
+
+cmd_finish() {
+  need_task
+  [ -z "$(git -C "$WORKTREE" status --porcelain)" ] || die "uncommitted changes in $WORKTREE; commit them first"
+  [ ! -d "$WORKTREE_B" ] || die "part B's checkout $WORKTREE_B was never merged; run: herdr-crew merge"
+  cmd_down
+  cloud_on && cloud_cleanup
+  step "✓ ready to merge"
+  if [[ -f $RUN/usage-start.tsv ]]; then
+    local usage_log=${XDG_DATA_HOME:-$HOME/.local/share}/usage-log/tasks.tsv
+    mkdir -p "${usage_log%/*}"
+    printf '%s\t%s\n' "$(cat "$RUN/usage-start.tsv")" "$(task_usage_snapshot)" >>"$usage_log"
+  fi
+  rm -f "$TASK_FILE"
+  cat <<EOF
+Task finished. Branch $BRANCH is kept in $WORKTREE (Herdr workspace "crew: ${BRANCH#crew/}").
+Commits: $(git -C "$REPO" rev-list --count "$BASE..$BRANCH")
+Merge:   git -C $(printf %q "$REPO") merge $BRANCH
+Cleanup: right-click the "crew: ${BRANCH#crew/}" workspace → Delete worktree checkout, then git -C $(printf %q "$REPO") branch -d $BRANCH
+Reports: $RUN
+EOF
+}
+
+# ---- cloud lane: jobs run as Claude Code cloud sessions (see bin/cloud-run) ----
+
+cloud_on() { [ "$LANE" = cloud ]; }
+
+# Move a local task into the cloud lane (e.g. Codex is out). Only from a clean worktree,
+# because the cloud only sees what is pushed.
+to_cloud() {
+  cloud_on && return 0
+  [ -z "$(git -C "$WORKTREE" status --porcelain)" ] ||
+    die "uncommitted work in $WORKTREE; commit it first (herdr-crew commit \"wip: ...\") so the cloud can see it"
+  LANE=cloud; save_task
+  echo "task moved to the cloud lane; the local agents are no longer used (herdr-crew down closes them)" >&2
+}
+
+# Commit a crew file (spec, brief, findings) into .cloud/ on the task branch.
+cloud_put() { # <src> <name>
+  mkdir -p "$WORKTREE/.cloud"
+  cp "$1" "$WORKTREE/.cloud/$2"
+  git -C "$WORKTREE" add ".cloud/$2"
+  git -C "$WORKTREE" diff --cached --quiet || git -C "$WORKTREE" commit -q -m "chore(crew): $2"
+}
+
+# Run one cloud job, wait (no tokens) until its report is pushed, then fast-forward the
+# worktree and copy the report into the run dir. Same output contract as prompt_and_wait.
+cloud_job() { # <new|follow-up> <kind> <model> <report-stem> <step-while-working> <step-when-done> <prompt>
+  local mode=$1 kind=$2 model=$3 stem=$4 doing=$5 done_step=$6 prompt=$7
+  local file=.cloud/$stem.md msg out url rc=0
+  msg=$(mktemp)
+  printf '%s\n\nWhen finished, write the report to %s, commit it, and push branch %s to origin. That push ends the job.\n' \
+    "$prompt" "$file" "$BRANCH" >"$msg"
+  step "$doing"
+  if [ "$mode" = new ] || [ -z "$CLOUD_SESSION" ]; then
+    out=$(cd "$WORKTREE" && cloud-run start --slug "${BRANCH#crew/}" --kind "$kind" --model "$model" "$msg") ||
+      { rm -f "$msg"; step "blocked: cloud start failed"; die "cloud-run start failed"; }
+    url=$(sed -n 's/^url=//p' <<<"$out")
+    # Fix rounds go back to the session that wrote the code.
+    if [ "$kind" = impl ] || [ "$kind" = fix ]; then
+      CLOUD_SESSION=$(sed -n 's/^session=//p' <<<"$out"); CLOUD_URL=$url; save_task
+    fi
+  else
+    git -C "$WORKTREE" push -q origin "$BRANCH" || { rm -f "$msg"; die "push of $BRANCH failed"; }
+    cloud-run say "$CLOUD_SESSION" "$msg" || { rm -f "$msg"; step "blocked: cloud send failed"; die "cloud-run say failed"; }
+    url=$CLOUD_URL
+  fi
+  rm -f "$msg"
+  echo "cloud session: $url" >&2
+  (cd "$WORKTREE" && cloud-run wait --file "$file" --branch "$BRANCH" --timeout "$CLOUD_TIMEOUT" --url "$url") >&2 || rc=$?
+  if [ "$rc" = 4 ]; then step "stalled: cloud $kind"; exit 4; fi
+  [ "$rc" = 0 ] || die "cloud-run wait failed ($rc)"
+  git -C "$WORKTREE" merge -q --ff-only "origin/$BRANCH" ||
+    { step "blocked: branch diverged"; die "origin/$BRANCH can't fast-forward $WORKTREE; inspect both and reconcile by hand"; }
+  cp "$WORKTREE/$file" "$RUN/$stem.md"
+  step "$done_step"
+  cat "$RUN/$stem.md"
+  printf '\nREPORT: %s\nSESSION: %s\n' "$RUN/$stem.md" "$url"
+}
+
+# Before the final commit: take the cloud's last pushes, drop .cloud/, and fold the
+# branch's commits back into the working tree so the task ends as one commit.
+cloud_squash() {
+  git -C "$WORKTREE" fetch -q origin "$BRANCH" 2>/dev/null &&
+    git -C "$WORKTREE" merge -q --ff-only "origin/$BRANCH" 2>/dev/null || true
+  git -C "$WORKTREE" rm -r -q --ignore-unmatch .cloud
+  rm -rf "$WORKTREE/.cloud"
+  git -C "$WORKTREE" reset -q --soft "$BASE"
+}
+
+# After finish: delete the pushed task branch, but only when the local commit holds
+# everything on it (apart from .cloud/).
+cloud_cleanup() {
+  git -C "$WORKTREE" fetch -q origin "$BRANCH" 2>/dev/null || return 0
+  if git -C "$WORKTREE" diff --quiet "origin/$BRANCH" HEAD -- . ':(exclude).cloud'; then
+    git -C "$WORKTREE" push -q origin --delete "$BRANCH" && echo "deleted origin/$BRANCH (all of it is in the local commit)"
+  else
+    echo "note: origin/$BRANCH has changes the local commit lacks; left it in place" >&2
+  fi
+}
+
+cmd_status() {
+  if [ -n "$WORKTREE" ]; then
+    printf 'task:     %s\nworktree: %s\nbase:     %s\nreports:  %s\nworkspace: %s\n' "$BRANCH" "$WORKTREE" "${BASE:0:12}" "$RUN" "${TASK_WS:-none}"
+    [ -d "$WORKTREE_B" ] && printf 'part B:   %s (not merged yet)\n' "$WORKTREE_B"
+    cloud_on && printf 'lane:     cloud%s\n' "${CLOUD_URL:+ (implementer: $CLOUD_URL)}"
+    show_untracked 2>/dev/null || true
+    git -C "$WORKTREE" diff --stat "$BASE" 2>/dev/null | tail -1 | sed 's/^/diff:    /' || true
+  else
+    echo "task:     none"
+  fi
+  cloud_on && return 0
+  local n
+  for n in "$IMPL" "$IMPL_B" "$SONNET"; do
+    if [ "$n" = "$IMPL_B" ] && ! agent_live "$n"; then continue; fi
+    printf '%-14s %s\n' "$n" "$(herdr agent get "$n" 2>/dev/null | jq -r '.result.agent | "\(.agent_status)  pane=\(.pane_id)"' || echo missing)"
+  done
+}
+
+cmd_read() {
+  herdr agent read "${1:?usage: herdr-crew read <name> [lines]}" --source recent-unwrapped --lines "${2:-120}"
+}
+
+sub=${1:-}; shift || true
+case "$sub" in
+  task) cmd_task "$@" ;;
+  up) cmd_up ;;
+  down) cmd_down ;;
+  scout) cmd_scout "$@" ;;
+  implement) cmd_implement "$@" ;;
+  merge) cmd_merge ;;
+  review) cmd_review "$@" ;;
+  fix) cmd_fix "$@" ;;
+  diff) cmd_diff "$@" ;;
+  commit) cmd_commit "$@" ;;
+  finish) cmd_finish ;;
+  status) cmd_status ;;
+  read) cmd_read "$@" ;;
+  step) need_task; step "$*" ;;
+  *) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+mode=${1:---all}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+hits=0
+# Patterns are written as regexes so the scanner's own source is safe to scan.
+generic='/home/[a-zA-Z][^/[:space:]]*|/Users/[a-zA-Z][^/[:space:]]*|/mnt/[a-z]/Users/[a-zA-Z]|[[:alnum:]-]+[.]ts[.]net|(^|[^0-9])10[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}|(^|[^0-9])192[.]168[.][0-9]{1,3}[.][0-9]{1,3}|(^|[^0-9])172[.](1[6-9]|2[0-9]|3[01])[.][0-9]{1,3}[.][0-9]{1,3}|(^|[^0-9])100[.](6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])[.][0-9]{1,3}[.][0-9]{1,3}'
+email='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}'
+denylist=$HOME/.config/agent-kit/denylist
+printf '%s\n' "$generic" >"$tmp/patterns"
+if [[ -f $denylist && ${AGENT_KIT_CI:-0} != 1 ]]; then
+  # Never echo external rules, including malformed patterns.
+  sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$denylist" >"$tmp/deny-patterns"
+  if [[ -s $tmp/deny-patterns ]]; then
+    valid=0
+    grep -Eq -f "$tmp/deny-patterns" /dev/null 2>/dev/null || valid=$?
+    [[ $valid != 2 ]] || { echo 'Invalid external denylist pattern' >&2; exit 2; }
+    cat "$tmp/deny-patterns" >>"$tmp/patterns"
+  fi
+fi
+check_filename() {
+  local file=$1 label=$2
+  case "$file" in */.env|.env|*/.env.*|.env.*|auth.json|*/auth.json|.credentials*|*/.credentials*|credentials.json|*/credentials.json)
+    echo "$label: forbidden sensitive filename"; hits=1 ;;
+  esac
+}
+scan_file() {
+  local source=$1 label=$2 status=0
+  check_filename "${3:-$label}" "$label"
+  # Two grep passes per file, regardless of its line count.
+  grep -anEi -f "$tmp/patterns" -- "$source" >"$tmp/matches" || status=$?
+  [[ $status -le 1 ]] || { echo 'Pattern scan failed' >&2; exit 2; }
+  cut -d: -f1 "$tmp/matches" >"$tmp/lines"
+  status=0
+  grep -anEo "$email" -- "$source" >"$tmp/emails" || status=$?
+  [[ $status -le 1 ]] || { echo 'Email scan failed' >&2; exit 2; }
+  awk -F: 'tolower($2) !~ /^noreply@/ && tolower($2) !~ /@example[.]com$/ {print $1}' "$tmp/emails" >>"$tmp/lines"
+  if [[ -s $tmp/lines ]]; then
+    sort -nu "$tmp/lines" >"$tmp/unique-lines"
+    awk -v label="$label" 'NR==FNR {wanted[$1]=1; next} FNR in wanted {printf "%s:%d:%s\n",label,FNR,$0}' "$tmp/unique-lines" "$source"
+    hits=1
+  fi
+}
+scan_range() {
+  local range=$1 commit record file _oldmode newmode _oldblob blob status destination
+  mkdir -p "$tmp/seen" "$tmp/tree/messages"
+  git rev-list "$range" >"$tmp/commits"
+  while IFS= read -r commit; do
+    destination=$tmp/tree/messages/$commit.txt
+    git show -s --format=%B "$commit" >"$destination"
+    scan_file "$destination" "$commit:commit-message"
+    # Inspect changed entries, including roots and every parent of merge commits.
+    # Each blob's content is scanned once even if many commits reuse it.
+    git diff-tree --root -m --no-commit-id --raw --no-abbrev --no-renames -r -z "$commit" >"$tmp/changes"
+    while IFS= read -r -d '' record && IFS= read -r -d '' file; do
+      read -r _oldmode newmode _oldblob blob status <<<"$record"
+      [[ $status != D && $newmode != 160000 ]] || continue
+      if [[ -f $tmp/seen/$blob ]]; then check_filename "$file" "$commit:$file"; continue; fi
+      destination=$tmp/tree/blobs/$blob/$file
+      mkdir -p "$(dirname "$destination")"
+      git cat-file blob "$blob" >"$destination"
+      scan_file "$destination" "$commit:$file" "$file"
+      : >"$tmp/seen/$blob"
+    done <"$tmp/changes"
+  done <"$tmp/commits"
+}
+case "$mode" in
+  --all)
+    while IFS= read -r -d '' file; do
+      [[ -f $file && ! -L $file ]] || continue
+      scan_file "$file" "$file"
+      mkdir -p "$tmp/tree/$(dirname "$file")"; cp "$file" "$tmp/tree/$file"
+    done < <(git ls-files --cached --others --exclude-standard -z) ;;
+  --staged)
+    while IFS= read -r -d '' file; do
+      [[ $(git ls-files --stage -- "$file") != 120000* ]] || continue
+      mkdir -p "$tmp/tree/$(dirname "$file")"
+      git show ":$file" >"$tmp/tree/$file"
+      scan_file "$tmp/tree/$file" "$file"
+    done < <(git diff --cached --name-only --diff-filter=ACMR -z) ;;
+  --range)
+    [[ $# == 3 ]] || { echo 'usage: leak-check --range <old> <new>' >&2; exit 2; }
+    if [[ $2 =~ ^0+$ ]] || ! git rev-parse --verify "$2^{commit}" >/dev/null 2>&1; then range=$3; else range=$2..$3; fi
+    git rev-parse --verify "$3^{commit}" >/dev/null
+    scan_range "$range" ;;
+  --commit-msg)
+    [[ $# == 2 && -f $2 ]] || { echo 'usage: leak-check --commit-msg <message-file>' >&2; exit 2; }
+    mkdir -p "$tmp/tree"
+    cp "$2" "$tmp/tree/COMMIT_EDITMSG"
+    scan_file "$tmp/tree/COMMIT_EDITMSG" 'commit-message' ;;
+  *) echo 'usage: leak-check --all | --staged | --range <old> <new> | --commit-msg <message-file>' >&2; exit 2 ;;
+esac
+if command -v gitleaks >/dev/null; then
+  mkdir -p "$tmp/tree"
+  gitleaks dir "$tmp/tree" --redact --no-banner || hits=1
+else echo 'Notice: gitleaks is not installed; skipping secret scan.' >&2; fi
+exit "$hits"

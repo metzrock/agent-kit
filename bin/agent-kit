@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Resolve the installed symlink without requiring GNU readlink -f.
+script=${BASH_SOURCE[0]}
+while [[ -L $script ]]; do
+  target=$(readlink "$script")
+  if [[ $target == /* ]]; then script=$target; else script=$(dirname "$script")/$target; fi
+done
+KIT_ROOT=$(cd "$(dirname "$script")/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$KIT_ROOT/lib/common.sh"
+# shellcheck source=lib/ui.sh
+source "$KIT_ROOT/lib/ui.sh"
+MODEL=${AGENT_KIT_MODEL:-opus}
+ALL_MODULES=(base lean usage crew look)
+load_module() {
+  case "$1" in base|lean|usage|crew|look) ;; *) fail "unknown module: $1" ;; esac
+  MODULE=$1
+  # shellcheck disable=SC1090
+  source "$KIT_ROOT/modules/$1/module.sh"
+}
+install_one() {
+  load_module "$1"
+  module_check || fail "module check failed: $1"
+  # Record intent first so uninstall can recover from an interrupted module install.
+  # shellcheck disable=SC2016 # jq variables are expanded by jq inside state_edit.
+  state_edit --arg m "$1" '.modules = ((.modules + [$m])|unique)'
+  module_install
+}
+install_modules() {
+  local selection=all dry=0 upstream=0 name requested names=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --modules) selection=${2:?missing module list}; shift 2 ;;
+      --model) MODEL=${2:?missing model}; shift 2 ;;
+      --yes) shift ;;
+      --dry-run) dry=1; shift ;;
+      --upstream) upstream=1; shift ;;
+      *) fail "unknown install option: $1" ;;
+    esac
+  done
+  case "$MODEL" in sonnet|opus) ;; *) fail 'model must be sonnet or opus' ;; esac
+  if [[ $selection == all ]]; then names=("${ALL_MODULES[@]}"); else
+    IFS=, read -r -a requested <<<"$selection"
+    names=(base)
+    for name in "${requested[@]}"; do
+      load_module "$name"
+      [[ $name != crew ]] || names+=(lean)
+      names+=("$name")
+    done
+  fi
+  if (( dry )); then printf 'Would install: %s (model: %s)\n' "${names[*]}" "$MODEL"; return; fi
+  for name in git jq curl; do command -v "$name" >/dev/null || fail "$name is required; install it first"; done
+  acquire_lock
+  state_init
+  if (( upstream )); then
+    if ! command -v claude >/dev/null; then
+      run_upstream_installer 'Claude Code' https://claude.ai/install.sh bash https://code.claude.com/docs/en/setup
+    fi
+    if [[ " ${names[*]} " == *' crew '* ]] && ! command -v herdr >/dev/null; then
+      run_upstream_installer Herdr https://herdr.dev/install.sh sh https://herdr.dev/
+    fi
+  fi
+  local installed=' '
+  for name in "${names[@]}"; do
+    [[ $installed != *" $name "* ]] || continue
+    install_one "$name"; installed+="$name "
+  done
+  printf 'Installed: %s\n' "${names[*]}"
+  echo 'Run agent-kit doctor. Sign in with claude yourself; the kit never handles authentication.'
+}
+doctor() {
+  local failed=0 name row path kind value
+  for name in bash git jq curl; do
+    if command -v "$name" >/dev/null; then echo "OK $name"; else echo "MISSING $name"; failed=1; fi
+  done
+  [[ -f $KIT_STATE ]] || { echo 'No modules installed'; return "$failed"; }
+  jq -e '.version==1' "$KIT_STATE" >/dev/null || return 1
+  while IFS= read -r row; do
+    path=$(jq -r .path <<<"$row"); kind=$(jq -r .kind <<<"$row"); value=$(jq -r .value <<<"$row")
+    if [[ $kind == link && ( ! -L $path || ! -e $path || $(readlink "$path") != "$value" ) ]]; then
+      # Only print paths relative to HOME, never environment values.
+      echo "BROKEN ~${path#"$HOME"}"; failed=1
+    fi
+  done < <(jq -c '.files[]' "$KIT_STATE")
+  if [[ -f $HOME/.claude/settings.json ]]; then jq -e 'type=="object"' "$HOME/.claude/settings.json" >/dev/null || failed=1; fi
+  for name in claude herdr gum; do command -v "$name" >/dev/null || echo "OPTIONAL $name unavailable (install upstream tools with install --upstream)"; done
+  if [[ ${1:-} == --usage ]]; then
+    usage_report
+  fi
+  return "$failed"
+}
+list_modules() {
+  local name description installed=false items='[]'
+  for name in "${ALL_MODULES[@]}"; do
+    load_module "$name"; description=$(module_describe); installed=false
+    if [[ -f $KIT_STATE ]] && jq -e --arg m "$name" '.modules|index($m)!=null' "$KIT_STATE" >/dev/null; then installed=true; fi
+    items=$(jq --arg n "$name" --arg d "$description" --argjson i "$installed" '.+[{name:$n,description:$d,installed:$i}]' <<<"$items")
+  done
+  if [[ ${1:-} == --json ]]; then echo "$items"; else jq -r '.[]|"\(.name): \(.description) [installed: \(.installed)]"' <<<"$items"; fi
+}
+update() {
+  [[ -f $KIT_STATE ]] || fail 'install modules first'
+  local old latest
+  old=$(git -C "$KIT_ROOT" rev-parse HEAD)
+  if git -C "$KIT_ROOT" remote get-url origin >/dev/null 2>&1; then
+    [[ -z $(git -C "$KIT_ROOT" status --porcelain) ]] || fail 'kit checkout has changes; update requires a clean checkout'
+    git -C "$KIT_ROOT" fetch --tags origin
+    latest=$(git -C "$KIT_ROOT" tag --list 'v[0-9]*' --sort=-version:refname | head -1)
+    [[ -n $latest ]] || fail 'no release tags found'
+    git -C "$KIT_ROOT" checkout --detach "$latest"
+    git -C "$KIT_ROOT" log --oneline "$old..$latest"
+    # Re-exec so the newly checked out installer owns the upgrade.
+    exec "$KIT_ROOT/bin/agent-kit" update --local
+  fi
+  refresh_modules
+}
+propose_template() {
+  local source=$1 dest=$2
+  [[ -f $dest ]] || return 0
+  cmp -s "$source" "$dest" && return 0
+  diff -u -L "current $(basename "$dest")" -L "kit template $(basename "$source")" "$dest" "$source" || [[ $? == 1 ]]
+  if [[ -t 0 && -t 1 ]] && ui_confirm "Adopt the new template for $(basename "$dest")?"; then backup_then_write "$source" "$dest"; fi
+  return 0
+}
+refresh_modules() {
+  acquire_lock
+  local name
+  MODEL=opus
+  if [[ -f $HOME/.claude/settings.json ]]; then
+    MODEL=$(jq -r '.model // "opus"' "$HOME/.claude/settings.json")
+  fi
+  case "$MODEL" in opus|sonnet) ;; *) MODEL=opus ;; esac
+  while IFS= read -r name; do install_one "$name"; done < <(jq -r '.modules[]' "$KIT_STATE")
+  MODULE=base
+  propose_template "$KIT_ROOT/modules/base/files/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+  propose_template "$KIT_ROOT/modules/base/files/config" "$KIT_CONFIG/config"
+  if jq -e '.modules|index("crew")!=null' "$KIT_STATE" >/dev/null; then
+    MODULE=crew; propose_template "$KIT_ROOT/modules/crew/files/config.toml" "$HOME/.config/herdr/config.toml"
+  fi
+  echo 'Template diffs above are proposals. Non-interactive updates preserve user-owned files.' 
+  doctor
+}
+customize() {
+  [[ -f $KIT_STATE ]] || fail 'install modules first'
+  acquire_lock
+  local theme patch herdr_theme prefix candidate
+  theme=$(ui_choose 'Claude theme' dark light dark-daltonized light-daltonized dark-ansi light-ansi)
+  patch=$(jq -cn --arg t "$theme" '{theme:$t,editorMode:"normal",autoContinueAtUsageLimit:false}')
+  echo 'Proposed Claude settings:'
+  echo "$patch" | jq .
+  if [[ -t 0 && -t 1 ]]; then ui_confirm 'Apply these settings?' || return 0; fi
+  install_one look
+  MODULE=look; settings_merge "$HOME/.claude/settings.json" "$patch"
+  herdr_theme=$(ui_choose 'Herdr theme' rose-pine catppuccin terminal tokyo-night dracula nord gruvbox one-dark solarized kanagawa vesper)
+  prefix=$(ui_choose 'Herdr prefix key' ctrl+b ctrl+a ctrl+space)
+  candidate=$(mktemp)
+  sed -e "s/name = \"rose-pine\"/name = \"$herdr_theme\"/" -e "s/prefix = \"ctrl+b\"/prefix = \"$prefix\"/" "$KIT_ROOT/modules/crew/files/config.toml" >"$candidate"
+  if [[ -f $HOME/.config/herdr/config.toml ]]; then
+    MODULE=look; propose_template "$candidate" "$HOME/.config/herdr/config.toml"
+  else MODULE=look; user_file "$candidate" "$HOME/.config/herdr/config.toml"; fi
+  rm "$candidate"
+  echo 'Herdr template uses arrow keys and mouse support. Automatic continuation remains off.' 
+}
+sub=${1:-help}; shift || true
+case "$sub" in
+  install) install_modules "$@" ;;
+  list) list_modules "$@" ;;
+  doctor) doctor "$@" ;;
+  update) if [[ ${1:-} == --local ]]; then refresh_modules; else update; fi ;;
+  customize) customize ;;
+  interview) echo 'coming in a later release' ;;
+  tips) printf '%s\n' 'Use /model to choose a model; /effort to adjust effort.' 'Use /clear for new work; /compact to retain a shorter task context.' 'Herdr: ctrl+b then an arrow moves focus; ctrl+b then v splits vertically.' ;;
+  uninstall)
+    [[ -f $KIT_STATE ]] || exit 0
+    acquire_lock
+    if [[ $# -gt 0 ]]; then
+      [[ $1 != base || $(jq '.modules|length' "$KIT_STATE") == 1 ]] || fail 'uninstall dependent modules before base'
+      [[ $1 != lean ]] || ! jq -e '.modules|index("crew")!=null' "$KIT_STATE" >/dev/null || fail 'crew depends on lean; uninstall crew first'
+      load_module "$1"; module_uninstall
+    else
+      while IFS= read -r name; do uninstall_module "$name"; done < <(jq -r '.modules|reverse[]' "$KIT_STATE")
+    fi
+    cleanup_state ;;
+  *) echo 'agent-kit install [--modules all|a,b] [--model opus|sonnet] [--yes] [--dry-run] [--upstream] | update | doctor [--usage] | list [--json] | customize | tips | uninstall [module] | interview' ;;
+esac

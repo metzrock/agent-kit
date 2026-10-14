@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=modules/usage/files/usage-lib.sh
+source "$(dirname "$0")/usage-lib.sh"
+read -r c cr _cw _cwr x xr _xw _xwr < <(usage_snapshot | usage_values)
+parts=()
+for pair in "Claude $c $cr" "Codex $x $xr"; do
+  read -r label used resets <<<"$pair"
+  percent=$(usage_percent "$used" "$resets")
+  [[ -n $percent ]] || continue
+  text="$label $percent%"
+  if (( percent >= ${USAGE_WARN_AT:-70} )) && [[ $resets =~ ^[0-9]+$ ]]; then text+=" ↻$(epoch_format "$resets" %H:%M)"; fi
+  parts+=("$text")
+done
+if [[ ${#parts[@]} -gt 0 ]]; then
+  text=${parts[0]}; for part in "${parts[@]:1}"; do text+=" · $part"; done
+  printf '%s\n' "$text"
+fi

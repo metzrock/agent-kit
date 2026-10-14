@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=modules/usage/files/usage-lib.sh
+source "$(dirname "$0")/usage-lib.sh"
+[[ -z ${CREW_AGENT:-} ]] || exit 0
+input=$(cat)
+sid=$(jq -r 'select(.agent_id==null)|.session_id // empty' <<<"$input" 2>/dev/null) || exit 0
+[[ $sid =~ ^[A-Za-z0-9-]+$ ]] || exit 0
+read -r c cr _cw _cwr x xr _xw _xwr < <(usage_snapshot | usage_values)
+c=$(usage_percent "$c" "$cr"); x=$(usage_percent "$x" "$xr")
+cl=$(usage_level "$c"); xl=$(usage_level "$x")
+state=$usage_cache/watch/$sid
+mkdir -p "${state%/*}"
+oldc=$cl oldx=$xl
+if [[ -f $state ]]; then read -r oldc oldx <"$state" || true; fi
+[[ $oldc =~ ^[0-3]$ ]] || oldc=$cl
+[[ $oldx =~ ^[0-3]$ ]] || oldx=$xl
+printf '%s %s\n' "$cl" "$xl" >"$state"
+text=''
+(( cl <= oldc )) || text+="Claude 5h ${c}%. "
+(( xl <= oldx )) || text+="Codex 5h ${x}%. "
+[[ -n $text ]] || exit 0
+jq -cn --arg c "Usage update: $text" '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$c}}'
