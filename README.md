@@ -4,6 +4,27 @@ agent-kit adds a set of ready-made settings, helpers and instructions to Claude 
 
 It is written for people who have tried Claude Code a few times and want a better starting point, without first learning every setting.
 
+## Quickstart
+
+On Linux, or inside WSL on Windows, paste this into a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.sh | bash
+```
+
+That installs the five core modules. Open a new terminal, check the result with `agent-kit doctor`, then start Claude Code with `claude`. The installer needs git, jq and curl; on Ubuntu, `sudo apt install -y git jq curl` gets all three.
+
+On Windows without WSL, open PowerShell as administrator and run:
+
+```powershell
+irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+It installs WSL and Ubuntu and asks you to restart. When you sign in again, accept the administrator prompt and it carries on, then installs the kit inside Ubuntu. The Windows installer is new and has only been run in practice mode (add `-DryRun` to see every step without doing it), so if anything goes wrong, follow [the manual steps](#on-windows-install-wsl-first).
+
+If you already use Claude Code, you can also paste [GIVE_THIS_TO_YOUR_AGENT.md](GIVE_THIS_TO_YOUR_AGENT.md) into it. Claude checks your system, asks which modules and model you want, shows each command before running it and installs the kit for you. It never reads your login or keys.
+
 ![Installing the kit, then checking it with agent-kit doctor](docs/demo/install.gif)
 
 ## What's in it
@@ -31,28 +52,13 @@ These install tools and skills written by other people. They are left out of a p
 
 ![Installing the writing add-on: the kit shows the source and exact command, asks first, then installs the humanizer skill](docs/demo/addons.gif)
 
-## The quick way: let Claude install it
-
-If you already have Claude Code, the easiest start is to open it and paste in the contents of [GIVE_THIS_TO_YOUR_AGENT.md](GIVE_THIS_TO_YOUR_AGENT.md). Claude then checks your system, asks which modules you want and which model to use day to day, shows each command before it runs it, installs the kit, runs the checkup and offers the interview described in [Make it yours](#make-it-yours). It never reads your login or keys.
-
-The rest of this page explains the same steps by hand.
-
 ## Before you start
 
 ### On Windows: install WSL first
 
 agent-kit is a set of bash scripts, so on Windows it runs inside WSL (Windows Subsystem for Linux), which gives you a Linux terminal on your Windows PC. Claude Code also works well there.
 
-There is a Windows installer, `install.ps1`, that sets up WSL and Ubuntu, picks up again after the restart and then installs the kit. It is new and has only been tried in its practice mode, which prints each step without doing it. If you want to try it, download it, read it, and do a practice run first, all in PowerShell opened as administrator:
-
-```powershell
-irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.ps1 -OutFile install.ps1
-notepad install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
-powershell -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-The steps below are the tested way to do it by hand.
+The [Quickstart](#quickstart) Windows installer does these steps for you. Doing them by hand is the tested way:
 
 1. Open PowerShell as administrator (right-click the Start button, then "Terminal (Admin)").
 2. Run:
@@ -88,13 +94,7 @@ If you don't have Claude Code yet, follow the [official setup guide](https://cod
 
 ## Install
 
-On Linux, macOS or inside WSL, one command downloads the latest release into `~/.local/share/agent-kit` and starts the installer:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.sh | bash
-```
-
-Anything you add after `bash -s --` goes to the installer, for example `| bash -s -- --modules usage,look --yes`. If you'd rather read the script before running it, download it with `curl -fsSL <same address> -o install.sh`, open it, then run `bash install.sh`.
+The [Quickstart](#quickstart) command downloads the latest release into `~/.local/share/agent-kit` and starts the installer. Anything you add after `bash -s --` goes to the installer, for example `| bash -s -- --modules usage,look --yes`. If you'd rather read the script before running it, download it with `curl -fsSL <same address> -o install.sh`, open it, then run `bash install.sh`.
 
 ### Install by hand
 
