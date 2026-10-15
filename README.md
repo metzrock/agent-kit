@@ -9,7 +9,7 @@ It is written for people who have tried Claude Code a few times and want a bette
 On Linux, or inside WSL on Windows, paste this into a terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.3/install.sh | bash
 ```
 
 That installs the five core modules. Open a new terminal, check the result with `agent-kit doctor`, then start Claude Code with `claude`. The installer needs git, jq and curl; on Ubuntu, `sudo apt install -y git jq curl` gets all three.
@@ -17,7 +17,7 @@ That installs the five core modules. Open a new terminal, check the result with 
 On Windows without WSL, open PowerShell as administrator and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.3/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 

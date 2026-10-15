@@ -209,8 +209,16 @@ customize() {
   echo 'Proposed Claude settings:'
   echo "$patch" | jq .
   if [[ -t 0 && -t 1 ]]; then ui_confirm 'Apply these settings?' || return 0; fi
-  install_one look
+  # Settings are tagged as look so `uninstall look` can undo them; the full module only on request.
+  if ! jq -e '.modules|index("look")!=null' "$KIT_STATE" >/dev/null &&
+     ui_confirm 'Also install the look module (editor, spinner tips, read-only git permissions)?'; then
+    install_one look
+  fi
   MODULE=look; settings_merge "$HOME/.claude/settings.json" "$patch"
+  if ! jq -e '.modules|index("crew")!=null' "$KIT_STATE" >/dev/null && ! command -v herdr >/dev/null; then
+    echo 'Herdr is not installed; skipping the Herdr settings. Automatic continuation remains off.'
+    return 0
+  fi
   herdr_theme=$(ui_choose 'Herdr theme' rose-pine catppuccin terminal tokyo-night dracula nord gruvbox one-dark solarized kanagawa vesper)
   prefix=$(ui_choose 'Herdr prefix key' ctrl+b ctrl+a ctrl+space)
   candidate=$(mktemp)
