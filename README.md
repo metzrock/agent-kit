@@ -184,6 +184,10 @@ A few Claude Code commands are worth knowing, and the kit's instructions refer t
 
 [Herdr](https://herdr.dev) is a separate app that runs coding agents in their own terminals, in panes and tabs, and keeps them working when you close the window. You don't need it to use the rest of the kit, so it makes sense to get comfortable with Claude Code on its own first.
 
+![Herdr with two agents side by side; the sidebar lists the workspaces and shows which agent is working and which is idle](docs/herdr-screenshot.png)
+
+<sub>Screenshot from the [Herdr repository](https://github.com/herdrdev/herdr) (Apache-2.0).</sub>
+
 The crew module builds on Herdr. When you ask for "the crew" on a coding task, your main Claude session acts as the lead: it plans the work and writes instructions, while helper agents in other Herdr panes look through the code, write the changes and review them. The work ends as a reviewed commit on its own git branch, and nothing is pushed or merged without you.
 
 To set it up, install crew with `--upstream` so the kit can install Herdr too (on Windows, do this inside WSL like everything else):
@@ -216,6 +220,8 @@ agent-kit customize
 
 It shows the settings it is about to change and asks before applying them.
 
+![Customizing: picking a Claude theme, confirming the settings, then picking a Herdr theme and prefix key](docs/demo/customize.gif)
+
 ## What it changes on your computer
 
 - It links its files into `~/.claude/` (subagents, rules and skills) and `~/.local/bin/` (commands), so they always point at the copy in the kit folder.
@@ -231,6 +237,8 @@ agent-kit update
 ```
 
 This moves the kit to its newest release and refreshes the installed modules. If a newer version of a file you own (like `CLAUDE.md`) is available, it shows you the difference and asks before using it. It then runs `doctor`.
+
+![Updating: the kit moves to the newest release, lists what changed, refreshes the modules and runs doctor](docs/demo/update.gif)
 
 To remove everything:
 
@@ -266,10 +274,10 @@ tools/lint         # shellcheck
 tools/leak-check   # looks for personal paths, addresses and secrets
 ```
 
-The demo GIFs are recorded with [VHS](https://github.com/charmbracelet/vhs) in a throwaway home folder. To record one again, run from the repo root:
+The demo GIFs are recorded with [VHS](https://github.com/charmbracelet/vhs) in a throwaway home folder. The end-to-end test in `tests/e2e/run.sh` runs each flow in a fresh one first and records it only if it passes. To record one again, run from the repo root:
 
 ```bash
-vhs docs/demo/install.tape
+tests/e2e/run.sh --record install
 ```
 
 ## License
