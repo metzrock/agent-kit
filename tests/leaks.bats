@@ -144,3 +144,25 @@ MOCK
   run "$KIT_ROOT/tools/leak-check" --all
   [[ $status == 2 && $output == 'Invalid external denylist pattern' ]]
 }
+@test "a personal author email is blocked before commit, on push and in a full scan" {
+  setup_repo
+  echo clean >sample.txt; git add sample.txt
+  git config user.email 'someone@example.com'
+  run "$KIT_ROOT/tools/leak-check" --staged
+  [ "$status" -eq 1 ] && [[ $output == *'not a noreply address: someone@example.com'* ]]
+  git commit -qm initial --no-verify
+  run "$KIT_ROOT/tools/leak-check" --range 0000000000000000000000000000000000000000 HEAD
+  [ "$status" -eq 1 ] && [[ $output == *'author email is not a noreply address'* ]]
+  run "$KIT_ROOT/tools/leak-check" --all
+  [ "$status" -eq 1 ] && [[ $output == *'committer email is not a noreply address'* ]]
+}
+@test "a GitHub noreply author passes" {
+  setup_repo
+  git config user.email '123+someone@users.noreply.github.com'
+  echo clean >sample.txt; git add sample.txt
+  run "$KIT_ROOT/tools/leak-check" --staged
+  [ "$status" -eq 0 ]
+  git commit -qm initial
+  run "$KIT_ROOT/tools/leak-check" --all
+  [ "$status" -eq 0 ]
+}

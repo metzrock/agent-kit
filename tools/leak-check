@@ -37,18 +37,38 @@ scan_file() {
   status=0
   grep -anEo "$email" -- "$source" >"$tmp/emails" || status=$?
   [[ $status -le 1 ]] || { echo 'Email scan failed' >&2; exit 2; }
-  awk -F: 'tolower($2) !~ /^noreply@/ && tolower($2) !~ /@example[.]com$/ {print $1}' "$tmp/emails" >>"$tmp/lines"
+  awk -F: 'tolower($2) !~ /^noreply@/ && tolower($2) !~ /@example[.]com$/ && tolower($2) !~ /@users[.]noreply[.]github[.]com$/ {print $1}' "$tmp/emails" >>"$tmp/lines"
   if [[ -s $tmp/lines ]]; then
     sort -nu "$tmp/lines" >"$tmp/unique-lines"
     awk -v label="$label" 'NR==FNR {wanted[$1]=1; next} FNR in wanted {printf "%s:%d:%s\n",label,FNR,$0}' "$tmp/unique-lines" "$source"
     hits=1
   fi
 }
+# Commit identities are public too: only noreply addresses may appear as author or committer.
+check_email() {
+  case "$1" in
+    *@users.noreply.github.com|noreply@*) ;;
+    *) printf '%s: %s email is not a noreply address: %s\n' "$2" "$3" "$1"; hits=1 ;;
+  esac
+}
+check_commit_identity() {
+  local author committer
+  IFS=$'\t' read -r author committer < <(git show -s --format=$'%ae\t%ce' "$1")
+  check_email "$author" "$1" author
+  check_email "$committer" "$1" committer
+}
+check_pending_identity() {
+  local ident
+  for ident in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+    check_email "$(git var "$ident" | sed -E 's/.*<([^>]*)>.*/\1/')" 'next commit' "${ident%_IDENT}"
+  done
+}
 scan_range() {
   local range=$1 commit record file _oldmode newmode _oldblob blob status destination
   mkdir -p "$tmp/seen" "$tmp/tree/messages"
   git rev-list "$range" >"$tmp/commits"
   while IFS= read -r commit; do
+    check_commit_identity "$commit"
     destination=$tmp/tree/messages/$commit.txt
     git show -s --format=%B "$commit" >"$destination"
     scan_file "$destination" "$commit:commit-message"
@@ -73,8 +93,12 @@ case "$mode" in
       [[ -f $file && ! -L $file ]] || continue
       scan_file "$file" "$file"
       mkdir -p "$tmp/tree/$(dirname "$file")"; cp "$file" "$tmp/tree/$file"
-    done < <(git ls-files --cached --others --exclude-standard -z) ;;
+    done < <(git ls-files --cached --others --exclude-standard -z)
+    if git rev-parse --verify -q HEAD >/dev/null; then
+      while IFS= read -r commit; do check_commit_identity "$commit"; done < <(git rev-list HEAD)
+    fi ;;
   --staged)
+    check_pending_identity
     while IFS= read -r -d '' file; do
       [[ $(git ls-files --stage -- "$file") != 120000* ]] || continue
       mkdir -p "$tmp/tree/$(dirname "$file")"
