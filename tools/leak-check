@@ -30,6 +30,11 @@ check_filename() {
 scan_file() {
   local source=$1 label=$2 status=0
   check_filename "${3:-$label}" "$label"
+  # Image bytes produce false matches; only their names are checked.
+  case "${3:-$label}" in *.gif|*.png|*.jpg|*.jpeg|*.webp) return 0 ;; esac
+  # The repo's own GitHub URL names its owner on purpose; scan everything else.
+  sed -E 's#github[.]com/[A-Za-z0-9-]+/agent-kit([.]git)?##g' -- "$source" >"$tmp/scan"
+  source=$tmp/scan
   # Two grep passes per file, regardless of its line count.
   grep -anEi -f "$tmp/patterns" -- "$source" >"$tmp/matches" || status=$?
   [[ $status -le 1 ]] || { echo 'Pattern scan failed' >&2; exit 2; }
