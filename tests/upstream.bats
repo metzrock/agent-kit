@@ -17,7 +17,7 @@ MOCK
 @test "non-interactive upstream offers print official commands without downloading" {
   setup_installer
   run run_upstream_installer Herdr https://herdr.dev/install.sh sh https://herdr.dev/
-  [[ $status == 0 && $output == *'Official command: curl -fsSL https://herdr.dev/install.sh | sh'* && $output == *'interactive confirmation is required'* ]]
+  [[ $status == 0 && $output == *'Official command: curl -fsSL https://herdr.dev/install.sh -o '* && $output == *'interactive confirmation is required'* ]]
   [[ ! -e $HOME/download-command && ! -e $HOME/installer-ran ]]
 }
 @test "confirmed upstream offer downloads to a file, executes and cleans it" {
@@ -26,7 +26,10 @@ MOCK
   run run_upstream_installer 'Claude Code' https://claude.ai/install.sh bash https://code.claude.com/docs/en/setup
   [[ $status == 0 && $output == *'https://code.claude.com/docs/en/setup'* ]]
   [[ $(cat "$HOME/installer-ran") == ran && $(cat "$HOME/prompt") == *'Claude Code installer?' ]]
-  [[ ! -e $(cat "$HOME/download-path") ]]
+  local installer
+  installer=$(cat "$HOME/download-path")
+  [[ $output == *"Official command: curl -fsSL https://claude.ai/install.sh -o $installer"* && $output == *"Official command: bash $installer"* ]]
+  [[ $output != *' | '* && ! -e $installer ]]
 }
 @test "failed upstream download never executes and cleans the temporary file" {
   setup_installer

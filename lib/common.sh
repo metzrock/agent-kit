@@ -149,12 +149,12 @@ uninstall_module() {
     rm "$tmp"
     state_edit --arg p "$path" --argjson e "$(jq .entries <<<"$result")" '(.settings[]|select(.path==$p)|.entries)=$e'
   done < <(jq -c '.settings[]' "$KIT_STATE")
-  state_edit --arg m "$m" '.files |= map(select(.module!=$m)) | .modules -= [$m]'
+  state_edit --arg m "$m" '.files |= map(select(.module!=$m)) | .modules -= [$m] | .pending_modules = ((.pending_modules // []) - [$m])'
 }
 cleanup_state() {
   local dir
   while IFS= read -r dir; do safe_destination "$dir" && rmdir "$dir" 2>/dev/null || true; done < <(jq -r '.dirs|reverse[]' "$KIT_STATE")
-  if [[ $(jq '.modules|length' "$KIT_STATE") == 0 ]]; then
+  if [[ $(jq '(.modules + (.pending_modules // []))|length' "$KIT_STATE") == 0 ]]; then
     rm "$KIT_STATE"
     rmdir "$KIT_CONFIG" "$HOME/.config" 2>/dev/null || true
   fi
@@ -179,17 +179,24 @@ usage_report() {
   ' "$log"
 }
 
+print_upstream_command() {
+  printf 'Official command:'
+  printf ' %q' "$@"; printf '\n'
+}
 run_upstream_installer() {
   local name=$1 url=$2 interpreter=$3 docs=$4 installer result=0
+  shift 4
+  installer=$(mktemp) || return
   printf '%s official installation: %s\n' "$name" "$docs"
-  printf 'Official command: curl -fsSL %s | %s\n' "$url" "$interpreter"
-  if ! ui_confirm "Download and run the official $name installer?"; then
-    echo 'Installer not run; interactive confirmation is required even with --yes.'
+  print_upstream_command curl -fsSL "$url" -o "$installer"
+  print_upstream_command "$interpreter" "$installer" "$@"
+  if [[ ${UPSTREAM_YES:-0} != 1 ]] && ! ui_confirm "Download and run the official $name installer?"; then
+    rm -f "$installer"
+    echo 'Installer not run; interactive confirmation is required (or pass --yes).'
     return 0
   fi
-  installer=$(mktemp)
   if curl -fsSL "$url" -o "$installer"; then
-    "$interpreter" "$installer" || result=$?
+    "$interpreter" "$installer" "$@" || result=$?
   else result=$?; fi
   rm -f "$installer"
   return "$result"
