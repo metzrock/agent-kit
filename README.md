@@ -44,7 +44,7 @@ agent-kit is a set of bash scripts, so on Windows it runs inside WSL (Windows Su
 There is a Windows installer, `install.ps1`, that sets up WSL and Ubuntu, picks up again after the restart and then installs the kit. It is new and has only been tried in its practice mode, which prints each step without doing it. If you want to try it, download it, read it, and do a practice run first, all in PowerShell opened as administrator:
 
 ```powershell
-irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.1/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.ps1 -OutFile install.ps1
 notepad install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -89,7 +89,7 @@ If you don't have Claude Code yet, follow the [official setup guide](https://cod
 On Linux, macOS or inside WSL, one command downloads the latest release into `~/.local/share/agent-kit` and starts the installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.2/install.sh | bash
 ```
 
 Anything you add after `bash -s --` goes to the installer, for example `| bash -s -- --modules usage,look --yes`. If you'd rather read the script before running it, download it with `curl -fsSL <same address> -o install.sh`, open it, then run `bash install.sh`.

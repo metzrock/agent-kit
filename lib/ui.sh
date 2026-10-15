@@ -2,7 +2,8 @@
 set -euo pipefail
 ui_choose() {
   local prompt=$1 answer choice; shift
-  if [[ -t 0 && -t 1 ]]; then
+  # Callers capture stdout with $(...); gum and the prompt draw on stderr, so check that instead.
+  if [[ -t 0 && -t 2 ]]; then
     if command -v gum >/dev/null; then gum choose --header "$prompt" "$@"; return; fi
     printf '%s (%s): ' "$prompt" "$*" >&2
     read -r answer || answer=''
