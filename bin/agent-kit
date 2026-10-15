@@ -13,19 +13,44 @@ source "$KIT_ROOT/lib/common.sh"
 source "$KIT_ROOT/lib/ui.sh"
 MODEL=${AGENT_KIT_MODEL:-opus}
 ALL_MODULES=(base lean usage crew look)
+AVAILABLE_MODULES=("${ALL_MODULES[@]}" plannotator design writing devtools)
+UPSTREAM_YES=0
+# shellcheck source=lib/upstream.sh
+source "$KIT_ROOT/lib/upstream.sh"
 load_module() {
-  case "$1" in base|lean|usage|crew|look) ;; *) fail "unknown module: $1" ;; esac
+  case "$1" in base|lean|usage|crew|look|plannotator|design|writing|devtools) ;; *) fail "unknown module: $1" ;; esac
   MODULE=$1
   # shellcheck disable=SC1090
   source "$KIT_ROOT/modules/$1/module.sh"
 }
 install_one() {
   load_module "$1"
-  module_check || fail "module check failed: $1"
-  # Record intent first so uninstall can recover from an interrupted module install.
-  # shellcheck disable=SC2016 # jq variables are expanded by jq inside state_edit.
-  state_edit --arg m "$1" '.modules = ((.modules + [$m])|unique)'
-  module_install
+  case "$1" in
+    plannotator|design|writing|devtools)
+      local result=0
+      if module_check; then :; else
+        result=$?
+        printf 'Failed preflight for module: %s (exit %s); no installation started.\n' "$1" "$result" >&2
+        return "$result"
+      fi
+      # Keep recovery intent separate from the successfully installed modules.
+      # shellcheck disable=SC2016
+      state_edit --arg m "$1" '.modules -= [$m] | .pending_modules = (((.pending_modules // []) + [$m])|unique)'
+      if module_install; then
+        # shellcheck disable=SC2016
+        state_edit --arg m "$1" '.modules = ((.modules + [$m])|unique) | .pending_modules -= [$m]'
+      else
+        result=$?
+        printf 'Failed/skipped module: %s (exit %s); re-run install to retry or uninstall to clean up.\n' "$1" "$result" >&2
+        return "$result"
+      fi ;;
+    *)
+      module_check || fail "module check failed: $1"
+      # Record intent first for the local modules' file recovery.
+      # shellcheck disable=SC2016
+      state_edit --arg m "$1" '.modules = ((.modules + [$m])|unique)'
+      module_install ;;
+  esac
 }
 install_modules() {
   local selection=all dry=0 upstream=0 name requested names=()
@@ -33,7 +58,7 @@ install_modules() {
     case "$1" in
       --modules) selection=${2:?missing module list}; shift 2 ;;
       --model) MODEL=${2:?missing model}; shift 2 ;;
-      --yes) shift ;;
+      --yes) UPSTREAM_YES=1; shift ;;
       --dry-run) dry=1; shift ;;
       --upstream) upstream=1; shift ;;
       *) fail "unknown install option: $1" ;;
@@ -123,7 +148,7 @@ doctor() {
 }
 list_modules() {
   local name description installed=false items='[]'
-  for name in "${ALL_MODULES[@]}"; do
+  for name in "${AVAILABLE_MODULES[@]}"; do
     load_module "$name"; description=$(module_describe); installed=false
     if [[ -f $KIT_STATE ]] && jq -e --arg m "$name" '.modules|index($m)!=null' "$KIT_STATE" >/dev/null; then installed=true; fi
     items=$(jq --arg n "$name" --arg d "$description" --argjson i "$installed" '.+[{name:$n,description:$d,installed:$i}]' <<<"$items")
@@ -203,17 +228,19 @@ case "$sub" in
   doctor) doctor "$@" ;;
   update) if [[ ${1:-} == --local ]]; then refresh_modules; else update; fi ;;
   customize) customize ;;
-  interview) echo 'coming in a later release' ;;
+  interview)
+    command -v claude >/dev/null || fail 'Claude Code is required. Install it with: curl -fsSL https://claude.ai/install.sh | bash (https://code.claude.com/docs/en/setup)'
+    exec claude --model sonnet "/kit-interview" ;;
   tips) printf '%s\n' 'Use /model to choose a model; /effort to adjust effort.' 'Use /clear for new work; /compact to retain a shorter task context.' 'Herdr: ctrl+b then an arrow moves focus; ctrl+b then v splits vertically.' ;;
   uninstall)
     [[ -f $KIT_STATE ]] || exit 0
     acquire_lock
     if [[ $# -gt 0 ]]; then
-      [[ $1 != base || $(jq '.modules|length' "$KIT_STATE") == 1 ]] || fail 'uninstall dependent modules before base'
+      [[ $1 != base || $(jq '((.modules + (.pending_modules // []))|unique|length)' "$KIT_STATE") == 1 ]] || fail 'uninstall dependent modules before base'
       [[ $1 != lean ]] || ! jq -e '.modules|index("crew")!=null' "$KIT_STATE" >/dev/null || fail 'crew depends on lean; uninstall crew first'
       load_module "$1"; module_uninstall
     else
-      while IFS= read -r name; do uninstall_module "$name"; done < <(jq -r '.modules|reverse[]' "$KIT_STATE")
+      while IFS= read -r name; do load_module "$name"; module_uninstall; done < <(jq -r '(.modules + (.pending_modules // [])|unique)|reverse[]' "$KIT_STATE")
     fi
     cleanup_state ;;
   *) echo 'agent-kit install [--modules all|a,b] [--model opus|sonnet] [--yes] [--dry-run] [--upstream] | update | doctor [--usage] | list [--json] | customize | tips | uninstall [module] | interview' ;;
