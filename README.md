@@ -1,6 +1,6 @@
 # agent-kit
 
-agent-kit adds a set of ready-made settings, helpers and instructions to Claude Code, so a new setup works more like one that has been tuned over months of daily use. It is split into five modules. You can install all of them or pick the ones you want, and the uninstall command removes everything it added and puts back any file it replaced.
+agent-kit adds a set of ready-made settings, helpers and instructions to Claude Code, so a new setup works more like one that has been tuned over months of daily use. It has five core modules and four optional add-ons from other projects. You can install all of them or pick the ones you want, and the uninstall command removes everything it added and puts back any file it replaced.
 
 It is written for people who have tried Claude Code a few times and want a better starting point, without first learning every setting.
 
@@ -18,11 +18,39 @@ It is written for people who have tried Claude Code a few times and want a bette
 
 ![Listing the modules and previewing which ones a choice would install](docs/demo/modules.gif)
 
+### Add-ons from other projects
+
+These install tools and skills written by other people. They are left out of a plain `install --yes`, so you only get them if you name them, for example `--modules writing,plannotator`. Before each one, the kit shows where it comes from and the exact command it will run, and asks first (`--yes` answers yes for you). Most of them need [Node.js](https://nodejs.org), which provides the `npx` command.
+
+| Add-on | What you get |
+| --- | --- |
+| plannotator | [Plannotator](https://github.com/backnotprop/plannotator), which opens Claude's plans and code changes in your browser so you can mark them up and send notes back. |
+| design | Design skills: [impeccable](https://github.com/pbakaus/impeccable) for building and reviewing interfaces, a local copy of Apple's Human Interface Guidelines, and lavish-axi for reviewing HTML pages Claude makes. Needs Python 3 as well. |
+| writing | Writing and planning skills: humanizer (rewrites text that sounds AI-written), grill-me and handoff, plus the i-have-adhd plugin. |
+| devtools | Helpers that let Claude work with GitHub (gh-axi) and Chrome (chrome-devtools-axi), rtk for shorter command output, and Cloudflare's plugin. |
+
+## The quick way: let Claude install it
+
+If you already have Claude Code, the easiest start is to open it and paste in the contents of [GIVE_THIS_TO_YOUR_AGENT.md](GIVE_THIS_TO_YOUR_AGENT.md). Claude then checks your system, asks which modules you want and which model to use day to day, shows each command before it runs it, installs the kit, runs the checkup and offers the interview described in [Make it yours](#make-it-yours). It never reads your login or keys.
+
+The rest of this page explains the same steps by hand.
+
 ## Before you start
 
 ### On Windows: install WSL first
 
 agent-kit is a set of bash scripts, so on Windows it runs inside WSL (Windows Subsystem for Linux), which gives you a Linux terminal on your Windows PC. Claude Code also works well there.
+
+There is a Windows installer, `install.ps1`, that sets up WSL and Ubuntu, picks up again after the restart and then installs the kit. It is new and has only been tried in its practice mode, which prints each step without doing it. If you want to try it, download it, read it, and do a practice run first, all in PowerShell opened as administrator:
+
+```powershell
+irm https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.0/install.ps1 -OutFile install.ps1
+notepad install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The steps below are the tested way to do it by hand.
 
 1. Open PowerShell as administrator (right-click the Start button, then "Terminal (Admin)").
 2. Run:
@@ -57,6 +85,16 @@ brew install jq
 If you don't have Claude Code yet, follow the [official setup guide](https://code.claude.com/docs/en/setup), or let the kit run the official installer for you with `--upstream` (see the next section). On Windows, install it inside the Ubuntu window, not in PowerShell.
 
 ## Install
+
+On Linux, macOS or inside WSL, one command downloads the latest release into `~/.local/share/agent-kit` and starts the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/metzrock/agent-kit/v0.1.0/install.sh | bash
+```
+
+Anything you add after `bash -s --` goes to the installer, for example `| bash -s -- --modules usage,look --yes`. If you'd rather read the script before running it, download it with `curl -fsSL <same address> -o install.sh`, open it, then run `bash install.sh`.
+
+### Install by hand
 
 ```bash
 git clone https://github.com/metzrock/agent-kit.git ~/agent-kit
@@ -159,6 +197,14 @@ The kit's Herdr settings turn on arrow keys and mouse support. The keys to start
 ## Make it yours
 
 Open `~/.claude/CLAUDE.md` and describe your goals and how you like to work. Claude reads it at the start of every session. It's your file: the kit never overwrites it.
+
+If you'd rather not write it from scratch, run:
+
+```bash
+agent-kit interview
+```
+
+This starts Claude Code on Sonnet, which uses less of your plan, and asks you a few questions at a time: about you, how you want Claude to work, how careful to be with usage, and how you like to stay focused. It then shows you a draft `CLAUDE.md`, and only writes it after you agree, keeping a backup of the old one. Run it again later to redo one section.
 
 To pick a different Claude theme, Herdr theme or Herdr key, run:
 

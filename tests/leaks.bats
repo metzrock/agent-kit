@@ -177,9 +177,10 @@ MOCK
   mkdir -p "$HOME/.config/agent-kit"
   printf 'sample-owner\n' >"$HOME/.config/agent-kit/denylist"
   echo 'git clone https://github.com/sample-owner/agent-kit.git' >README.md
+  echo 'curl https://raw.githubusercontent.com/sample-owner/agent-kit/v0.1.0/install.sh' >>README.md
   run "$KIT_ROOT/tools/leak-check" --all
   [[ $status == 0 ]]
   echo 'contact sample-owner' >>README.md
   run "$KIT_ROOT/tools/leak-check" --all
-  [[ $status == 1 && $output == *'README.md:2:'* ]]
+  [[ $status == 1 && $output == *'README.md:3:'* ]]
 }
