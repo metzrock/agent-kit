@@ -9,7 +9,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 # Publish this tag before distributing the Windows bootstrap.
-$KitRef = 'v0.1.0'
+$KitRef = 'v0.1.1'
 $BootstrapUrl = "https://raw.githubusercontent.com/metzrock/agent-kit/$KitRef/install.sh"
 
 function Show-Action([string]$Text) {

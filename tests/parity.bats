@@ -14,7 +14,10 @@ load helper
   [[ $(ls -A "$other/dir") == keep && $(cat "$other/dir/keep") == untouched ]]
 }
 @test "normalized hooks and preexisting statusLine stay user owned" {
-  mkdir -p "$HOME/.claude"
+  mkdir -p "$HOME/.claude" "$HOME/stub-bin"
+  # The user's own statusLine command must exist for doctor to pass.
+  printf '#!/bin/sh\n' >"$HOME/stub-bin/claude-statusline"; chmod +x "$HOME/stub-bin/claude-statusline"
+  PATH=$HOME/stub-bin:$PATH
   cat >"$HOME/.claude/settings.json" <<'JSON'
 {"statusLine":{"command":"claude-statusline","custom":true},"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"\"$HOME/.local/bin/prompt-clock\""}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"~/.local/bin/usage-watch"}]}]}}
 JSON

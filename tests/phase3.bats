@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+bats_require_minimum_version 1.5.0
 load helper
 
 setup_upstream() {
@@ -155,7 +156,7 @@ MOCK
   [[ $(cat "$HOME/git-commands") == *'checkout --detach v2.0.0'* ]]
   run bash "$KIT_ROOT/install.sh" --model sonnet
   [[ $status == 0 && $(cat "$HOME/kit-args") == 'install --model sonnet' ]]
-  [[ $(rg -c '^clone ' "$HOME/git-commands") == 1 ]]
+  [[ $(grep -c '^clone ' "$HOME/git-commands") == 1 ]]
 }
 @test "bootstrap respects pin and refuses dirty or foreign destinations" {
   setup_git
