@@ -75,6 +75,8 @@ link_kit_file() {
   writable_destination "$dest" || return 0
   [[ -f $source ]] || fail "missing kit file: $source"
   if jq -e --arg p "$dest" '.files[] | select(.path==$p)' "$KIT_STATE" >/dev/null; then
+    # A kit link the user deleted is restored; one they changed is left alone.
+    if [[ ! -e $dest && ! -L $dest ]]; then ensure_dir "$(dirname "$dest")"; ln -s "$source" "$dest"; return 0; fi
     [[ -L $dest && $(readlink "$dest") == "$source" ]] || printf 'Preserving changed file: %s\n' "$dest" >&2
     return 0
   fi

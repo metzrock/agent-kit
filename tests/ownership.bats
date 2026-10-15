@@ -139,3 +139,10 @@ JSON
   "$KIT_ROOT/bin/agent-kit" uninstall
   [[ ! -e $HOME/.claude/settings.json ]]
 }
+@test "a deleted kit link is restored on the next install" {
+  "$KIT_ROOT/bin/agent-kit" install --modules lean --yes
+  rm "$HOME/.claude/agents/implementer.md"
+  run "$KIT_ROOT/bin/agent-kit" install --modules lean --yes
+  [[ $output != *Preserving* ]]
+  [[ -L $HOME/.claude/agents/implementer.md ]]
+}
