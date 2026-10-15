@@ -5,4 +5,4 @@ while IFS= read -r -d '' file; do
   case "$file" in *.bats) continue ;; esac
   if [[ $(head -1 "$file") == '#!/usr/bin/env bash' ]]; then files+=("$file"); fi
 done < <(git ls-files --cached --others --exclude-standard -z)
-shellcheck -x "${files[@]}"
+shellcheck -x ${files[@]+"${files[@]}"}

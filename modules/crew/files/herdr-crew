@@ -14,7 +14,7 @@
 #                                     hand the spec to the implementer and wait; with two specs a
 #                                     second Codex implementer builds part B in its own checkout,
 #                                     then part B is merged into the task worktree
-#   herdr-crew review [--by cloud]  have Sonnet (or a fresh Codex agent, high effort, or a
+#   herdr-crew review [--by codex|cloud]  have Sonnet (or a fresh Codex agent, high effort, or a
 #                                     fresh cloud session) review the diff
 #   herdr-crew fix [--by sonnet|cloud] <findings.md>
 #                                     hand review findings back to the implementer and wait
@@ -37,19 +37,26 @@
 # 5 usage limit reached (Codex, or Claude for Sonnet), 6 part B overlaps part A.
 set -euo pipefail
 
-config_implementer=sonnet
-if [[ -f $HOME/.config/agent-kit/config ]]; then
-  while IFS= read -r config_line || [[ -n $config_line ]]; do
-    case "$config_line" in CREW_IMPLEMENTER=*) config_implementer=${config_line#*=} ;; esac
-  done <"$HOME/.config/agent-kit/config"
-fi
-CREW_IMPLEMENTER=${CREW_IMPLEMENTER:-$config_implementer}
+# Read configuration as data; environment values take precedence.
+for config_key in CREW_IMPLEMENTER CREW_IMPL_PROFILE CREW_CODEX_ARGS CREW_CODEX_AUTO_TRUST CREW_SONNET_NOTE; do
+  config_value=''
+  if [[ -f $HOME/.config/agent-kit/config ]]; then
+    while IFS= read -r config_line || [[ -n $config_line ]]; do
+      [[ $config_line != "$config_key="* ]] || config_value=${config_line#*=}
+    done <"$HOME/.config/agent-kit/config"
+  fi
+  [[ -n ${!config_key+x} ]] || printf -v "$config_key" '%s' "$config_value"
+done
+CREW_IMPLEMENTER=${CREW_IMPLEMENTER:-sonnet}
+CREW_CODEX_AUTO_TRUST=${CREW_CODEX_AUTO_TRUST:-0}
 case "$CREW_IMPLEMENTER" in sonnet|codex) ;; *) echo 'CREW_IMPLEMENTER must be sonnet or codex' >&2; exit 1 ;; esac
-# Reject unavailable lanes before contacting a running workspace.
+# Only option values select the cloud lane; a slug or filename can be cloud.
+previous=''
 for arg in "$@"; do
-  if [[ $arg == --cloud || $arg == cloud ]]; then
+  if [[ $arg == --cloud || ( $previous == --by && $arg == cloud ) ]]; then
     command -v cloud-run >/dev/null || { echo 'Cloud lane unavailable: cloud-run is not on PATH' >&2; exit 1; }
   fi
+  previous=$arg
 done
 IMPL=${CREW_IMPL_NAME:-implementer}
 IMPL_B=${CREW_IMPL_B_NAME:-implementer-b}
@@ -91,6 +98,8 @@ WORKTREE_B=${WORKTREE:+$WORKTREE-b}
 # Sonnet's standing orders, on top of the user's normal Claude Code setup.
 SONNET_ROLE="You are the Sonnet helper in herdr-crew, an automated coding crew driven by a script; Opus orchestrates and reads only your reports. Do exactly the job in each prompt, write the requested report file, then reply only with its path. Never ask questions (nobody is watching): make reasonable assumptions and list them in the report. Do not commit, do not touch anything outside the current checkout except the report file."
 
+[[ -z $CREW_SONNET_NOTE ]] || SONNET_ROLE+=$'\n'"$CREW_SONNET_NOTE"
+
 # Show the task's current step in the sidebar ($crew token on the task workspace).
 step() {
   [ -n "$TASK_WS" ] && [ -n "$*" ] || return 0
@@ -114,6 +123,20 @@ start_agent() { # <kind> <name> <pane> <cwd> <agent args...>
   # Both Codex and Claude key folder trust by the main repository root, even inside a worktree.
   root=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
     root=$(dirname "$root") || root=$cwd
+  if [[ $kind == codex ]]; then
+    local extra=() profile=() config=${CODEX_HOME:-$HOME/.codex}/config.toml section
+    [[ -z $CREW_IMPL_PROFILE ]] || profile=(-p "$CREW_IMPL_PROFILE")
+    read -r -a extra <<<"$CREW_CODEX_ARGS"
+    set -- ${profile[@]+"${profile[@]}"} ${extra[@]+"${extra[@]}"} "$@"
+    if [[ $CREW_CODEX_AUTO_TRUST == 1 ]]; then
+      section="[projects.$(jq -Rn --arg r "$root" '$r')]"
+      mkdir -p "${config%/*}"
+      # Existing project policy is user-owned, including explicitly untrusted entries.
+      if [[ ! -f $config ]] || ! grep -Fq "${section:1:${#section}-2}" "$config"; then
+        printf '\n%s\ntrust_level = "trusted"\n' "$section" >>"$config"
+      fi
+    fi
+  fi
   if ! herdr agent start "$name" --kind "$kind" --pane "$pane" --timeout 60000 -- "$@" >/dev/null; then
     screen=$(herdr pane read "$pane" --source visible 2>/dev/null || true)
     if grep -q 'Yes, I trust this folder' <<<"$screen"; then
@@ -282,7 +305,7 @@ cmd_task() {
   if [ "$lane" = cloud ]; then
     [[ $(git -C "$repo" remote get-url origin 2>/dev/null) == *github.com* ]] ||
       die "the cloud lane needs the repo on GitHub (origin); use a local task instead"
-    cloud-run check || die "cloud lane is unavailable; use a local task"
+    cloud-run check || die "cloud lane is unavailable; run cloud-run budget; use a local task"
   fi
   if [ -n "$(git -C "$repo" status --porcelain)" ]; then
     echo "note: uncommitted changes in $repo are NOT included in the task worktree" >&2
@@ -365,7 +388,6 @@ impl_prompt() { # <spec> <dir> <report> [part-note]
 cmd_implement() {
   need_task
   local by=$CREW_IMPLEMENTER model=$CLOUD_MODEL
-  cloud_on && by=cloud
   cloud_on && by=cloud
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -517,7 +539,7 @@ cmd_review() {
   need_task
   local by=sonnet
   cloud_on && by=cloud
-  case "${1:-}" in --by) by=${2:?--by takes sonnet, codex or cloud} ;; "") ;; *) die "usage: herdr-crew review [--by cloud]" ;; esac
+  case "${1:-}" in --by) by=${2:?--by takes sonnet, codex or cloud} ;; "") ;; *) die "usage: herdr-crew review [--by codex|cloud]" ;; esac
   case "$by" in sonnet|codex|cloud) ;; *) die "--by takes sonnet, codex or cloud" ;; esac
   local n=1; while [ -e "$RUN/review-$n.md" ]; do n=$((n + 1)); done
   local where=$RUN; [ "$by" = cloud ] && where=.cloud

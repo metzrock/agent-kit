@@ -21,7 +21,7 @@ load helper
   [[ $status == 0 && -z $output ]]
   echo '{"rate_limits":{"five_hour":{"used_percentage":80,"resets_at":9999999999}}}' >"$cache"
   run bash -c 'echo "{\"session_id\":\"test-session\"}" | "$HOME/.local/bin/usage-watch"'
-  [[ $status == 0 && $output == *'Claude 5h 80%'* ]]
+  [[ $status == 0 && $output == *'Claude 5h usage is now 80%'* ]]
   run bash -c 'echo "{\"session_id\":\"test-session\"}" | "$HOME/.local/bin/usage-watch"'
   [[ $status == 0 && -z $output ]]
 }

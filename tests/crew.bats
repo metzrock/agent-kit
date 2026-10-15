@@ -50,9 +50,9 @@ MOCK
 set -euo pipefail
 printf '%s\n' "$*" >>"$HOME/commands"
 case "$1 $2" in
-  'workspace list') jq -cn --arg h "$HOME" '{result:{workspaces:[{workspace_id:"w1",number:1,label:"project",worktree:{repo_root:$h}},{workspace_id:"w2",number:2,label:"duplicate",worktree:{repo_root:$h}}]}}' ;;
+  'workspace list') jq -cn --arg h "$HOME" '{result:{workspaces:[{workspace_id:"w1",focused:true,number:1,label:"project",worktree:{repo_root:$h}},{workspace_id:"w2",number:2,label:"duplicate",worktree:{repo_root:$h}}]}}' ;;
   'pane list') jq -cn --arg h "$HOME" '{result:{panes:[{pane_id:"p1",workspace_id:"w1",tab_id:"t1",cwd:$h,agent:"claude"},{pane_id:"p2",workspace_id:"w2",tab_id:"t2",cwd:$h,agent:"claude"},{pane_id:"p3",workspace_id:"w2",tab_id:"t2",cwd:$h,agent:"codex"}]}}' ;;
-  'tab list') if [[ $4 == w1 ]]; then t=t1; else t=t2; fi; jq -cn --arg t "$t" '{result:{tabs:[{tab_id:$t,label:"task"}]}}' ;;
+  'tab list') if [[ $4 == w1 ]]; then t=t1; else t=t2; fi; jq -cn --arg t "$t" '{result:{tabs:[{tab_id:$t,label:"abcdefghijklmnopqrstuvwxyz0123456789"}]}}' ;;
   'pane move') echo '{"result":{"move_result":{"created_tab":{"tab_id":"new"}}}}' ;;
   *) echo '{}' ;;
 esac
@@ -63,4 +63,6 @@ MOCK
   grep -q 'pane move p2 --workspace w1 --new-tab' "$HOME/commands"
   grep -q 'pane move p3 --tab new --split right' "$HOME/commands"
   ! grep -q 'pane close' "$HOME/commands"
+  grep -q 'workspace focus w1' "$HOME/commands"
+  grep -q -- '--label abcdefghijklmnopqrstuvwxyz01234…' "$HOME/commands"
 }

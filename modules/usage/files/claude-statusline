@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cache=${XDG_CACHE_HOME:-$HOME/.cache}/agent-kit-usage
+# shellcheck source=modules/usage/files/usage-lib.sh
+source "$(dirname "$0")/usage-lib.sh"
+cache=$usage_cache
 input=$(cat)
 jq -e 'type=="object"' <<<"$input" >/dev/null 2>&1 || exit 0
 mkdir -p "$cache"
 tmp=$(mktemp "$cache/status.XXXXXX")
 printf '%s\n' "$input" >"$tmp"
 mv "$tmp" "$cache/claude-statusline.json"
-jq -r '[.model.display_name // empty, (.workspace.current_dir // empty),
+jq -r --arg show "${STATUSLINE_SHOW_DIR:-0}" '[.model.display_name // empty, (if $show=="1" then .workspace.current_dir // empty else empty end),
   (.rate_limits.five_hour.used_percentage // empty | "5h \(floor)%"),
   (.rate_limits.seven_day.used_percentage // empty | "wk \(floor)%")]|join(" · ")' <<<"$input"

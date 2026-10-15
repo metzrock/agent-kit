@@ -43,7 +43,7 @@ install_modules() {
   if [[ $selection == all ]]; then names=("${ALL_MODULES[@]}"); else
     IFS=, read -r -a requested <<<"$selection"
     names=(base)
-    for name in "${requested[@]}"; do
+    for name in ${requested[@]+"${requested[@]}"}; do
       load_module "$name"
       [[ $name != crew ]] || names+=(lean)
       names+=("$name")
@@ -53,6 +53,7 @@ install_modules() {
   for name in git jq curl; do command -v "$name" >/dev/null || fail "$name is required; install it first"; done
   acquire_lock
   state_init
+  state_edit '.skipped=[]'
   if (( upstream )); then
     if ! command -v claude >/dev/null; then
       run_upstream_installer 'Claude Code' https://claude.ai/install.sh bash https://code.claude.com/docs/en/setup
@@ -66,11 +67,30 @@ install_modules() {
     [[ $installed != *" $name "* ]] || continue
     install_one "$name"; installed+="$name "
   done
-  printf 'Installed: %s\n' "${names[*]}"
+  install_summary "${names[*]}"
   echo 'Run agent-kit doctor. Sign in with claude yourself; the kit never handles authentication.'
 }
+install_summary() {
+  local count
+  count=$(jq '.skipped // [] | length' "$KIT_STATE")
+  if (( count > 0 )); then
+    printf 'Installed with %s skipped paths: %s\n' "$count" "$1"
+    jq -r '.skipped[] | "  " + .' "$KIT_STATE"
+  else printf 'Installed: %s\n' "$1"; fi
+}
+# Extract the first executable without evaluating user-authored shell text.
+settings_executables() {
+  jq -r --arg home "$HOME" '
+    [.statusLine.command?, .hooks[]?[]?.hooks[]?.command?] | .[] | strings
+    | sub("^ +"; "")
+    | if startswith("\"") then split("\"")[1]
+      elif startswith("\u0027") then split("\u0027")[1]
+      else split(" ")[0] end
+    | gsub("\\$\\{HOME\\}|\\$HOME"; $home) | sub("^~(?=/)"; $home)
+  ' "$1"
+}
 doctor() {
-  local failed=0 name row path kind value
+  local failed=0 name row path kind value executable
   for name in bash git jq curl; do
     if command -v "$name" >/dev/null; then echo "OK $name"; else echo "MISSING $name"; failed=1; fi
   done
@@ -83,7 +103,18 @@ doctor() {
       echo "BROKEN ~${path#"$HOME"}"; failed=1
     fi
   done < <(jq -c '.files[]' "$KIT_STATE")
-  if [[ -f $HOME/.claude/settings.json ]]; then jq -e 'type=="object"' "$HOME/.claude/settings.json" >/dev/null || failed=1; fi
+  while IFS= read -r path; do
+    if ! safe_destination "$path"; then echo "USER-OWNED ~${path#"$HOME"}"; fi
+  done < <(jq -r '.skipped // [] | .[]' "$KIT_STATE")
+  if [[ -f $HOME/.claude/settings.json ]]; then
+    jq -e 'type=="object"' "$HOME/.claude/settings.json" >/dev/null || failed=1
+    while IFS= read -r executable; do
+      if [[ $executable == */* ]]; then
+        [[ -f $executable ]] && continue
+      elif command -v "$executable" >/dev/null 2>&1; then continue; fi
+      printf 'MISSING settings command: %s\n' "$executable"; failed=1
+    done < <(settings_executables "$HOME/.claude/settings.json")
+  fi
   for name in claude herdr gum; do command -v "$name" >/dev/null || echo "OPTIONAL $name unavailable (install upstream tools with install --upstream)"; done
   if [[ ${1:-} == --usage ]]; then
     usage_report
@@ -117,6 +148,7 @@ update() {
 }
 propose_template() {
   local source=$1 dest=$2
+  safe_destination "$dest" || return 0
   [[ -f $dest ]] || return 0
   cmp -s "$source" "$dest" && return 0
   diff -u -L "current $(basename "$dest")" -L "kit template $(basename "$source")" "$dest" "$source" || [[ $? == 1 ]]
@@ -125,6 +157,7 @@ propose_template() {
 }
 refresh_modules() {
   acquire_lock
+  state_edit '.skipped=[]'
   local name
   MODEL=opus
   if [[ -f $HOME/.claude/settings.json ]]; then
@@ -138,6 +171,7 @@ refresh_modules() {
   if jq -e '.modules|index("crew")!=null' "$KIT_STATE" >/dev/null; then
     MODULE=crew; propose_template "$KIT_ROOT/modules/crew/files/config.toml" "$HOME/.config/herdr/config.toml"
   fi
+  install_summary 'updated modules'
   echo 'Template diffs above are proposals. Non-interactive updates preserve user-owned files.' 
   doctor
 }

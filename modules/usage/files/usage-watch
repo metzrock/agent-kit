@@ -12,12 +12,22 @@ cl=$(usage_level "$c"); xl=$(usage_level "$x")
 state=$usage_cache/watch/$sid
 mkdir -p "${state%/*}"
 oldc=$cl oldx=$xl
-if [[ -f $state ]]; then read -r oldc oldx <"$state" || true; fi
+if [[ -f $state ]]; then read -r oldc oldx <"$state" || true
+else find "${state%/*}" -type f -mtime +7 -delete; fi
 [[ $oldc =~ ^[0-3]$ ]] || oldc=$cl
 [[ $oldx =~ ^[0-3]$ ]] || oldx=$xl
 printf '%s %s\n' "$cl" "$xl" >"$state"
-text=''
-(( cl <= oldc )) || text+="Claude 5h ${c}%. "
-(( xl <= oldx )) || text+="Codex 5h ${x}%. "
-[[ -n $text ]] || exit 0
+parts=()
+watch_message() {
+  local label=$1 percent=$2 resets=$3 formatted=''
+  printf '%s 5h usage is now %s%%' "$label" "$percent"
+  [[ ! $resets =~ ^[0-9]+$ ]] || formatted=$(epoch_format "$resets" %H:%M)
+  [[ -z $formatted ]] || printf ' (resets %s)' "$formatted"
+  return 0
+}
+(( cl <= oldc )) || parts+=("$(watch_message Claude "$c" "$cr")")
+(( xl <= oldx )) || parts+=("$(watch_message Codex "$x" "$xr")")
+[[ ${#parts[@]} -gt 0 ]] || exit 0
+text=${parts[0]}
+for part in ${parts[@]+"${parts[@]:1}"}; do text+="; $part"; done
 jq -cn --arg c "Usage update: $text" '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$c}}'

@@ -3,9 +3,10 @@
 set -euo pipefail
 apply=0 close_empty=0
 for arg in "$@"; do
-  case "$arg" in --apply) apply=1 ;; --close-empty) close_empty=1 ;; --help|-h) echo 'herdr-tidy [--apply] [--close-empty]'; exit 0 ;; *) echo "Unknown option: $arg" >&2; exit 1 ;; esac
+  case "$arg" in --apply) apply=1 ;; --close-empty) close_empty=1 ;; --help|-h) echo 'herdr-tidy [--apply] [--close-empty]. Preview grouping tabs into one workspace per project, keeping live agents and split panes together. Use --apply to make the moves.'; exit 0 ;; *) echo "Unknown option: $arg" >&2; exit 1 ;; esac
 done
 workspaces=$(herdr workspace list | jq '.result.workspaces')
+focused=$(jq -r '.[]|select(.focused==true or .is_focused==true)|.workspace_id' <<<"$workspaces")
 panes=$(herdr pane list | jq '.result.panes')
 enriched='[]' actions='[]'
 add_action() {
@@ -43,13 +44,14 @@ while IFS= read -r group; do
       done < <(jq -c --arg w "$id" --arg t "$tid" '.[]|select(.workspace_id==$w and .tab_id==$t)' <<<"$panes")
       [[ $(jq length <<<"$live") != 0 ]] || continue
       if [[ $name =~ ^[0-9]+$ || -z $name ]]; then
-        name=$(jq -r '[.[]|select(.agent!=null)|.terminal_title_stripped // empty|select(.!="claude" and .!="claude code" and .!="codex" and .!="")][0] // empty | .[0:32]' <<<"$live")
+        name=$(jq -r '[.[]|select(.agent!=null)|.terminal_title_stripped // empty|select(.!="claude" and .!="claude code" and .!="codex" and .!="")][0] // empty | if length>32 then .[0:31]+"…" else . end' <<<"$live")
         if [[ $id == "$keep" ]]; then
           [[ -z $name ]] || add_action "name tab $tid $name" tab rename "$tid" "$name"
           continue
         fi
         [[ -n $name ]] || name=$label
       fi
+      name=$(jq -rn --arg n "$name" '$n | if length>32 then .[0:31]+"…" else . end')
       [[ $id != "$keep" ]] || continue
       first=$(jq -r '.[0].pane_id' <<<"$live")
       add_action "move workspace $id into $label as tab $name" pane move "$first" --workspace "$keep" --new-tab --label "$name" --no-focus
@@ -73,4 +75,7 @@ while IFS= read -r action; do
     [[ -z $created ]] || new_tab=$created
   fi
 done < <(jq -c '.[]' <<<"$actions")
+if [[ -n $focused ]] && herdr workspace list | jq -e --arg id "$focused" '.result.workspaces|any(.workspace_id==$id)' >/dev/null; then
+  herdr workspace focus "$focused" >/dev/null
+fi
 echo 'done'

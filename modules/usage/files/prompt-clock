@@ -4,23 +4,58 @@ set -euo pipefail
 source "$(dirname "$0")/usage-lib.sh"
 input=$(cat)
 line="Current local time: $(date '+%A %Y-%m-%d %H:%M %Z')"
-read -r c cr cw cwr x xr xw xwr < <(usage_snapshot | usage_values)
-c=$(usage_percent "$c" "$cr"); cw=$(usage_percent "$cw" "$cwr")
-x=$(usage_percent "$x" "$xr"); xw=$(usage_percent "$xw" "$xwr")
+snapshot=$(usage_snapshot)
+read -r c cr cw cwr x xr xw xwr < <(usage_values <<<"$snapshot")
+ct=$(jq -r '.claude_as_of // 0' <<<"$snapshot")
+xt=$(jq -r '.codex_as_of // 0' <<<"$snapshot")
+sid=$(jq -r '.session_id // "" | gsub("[\\t\\r\\n]"; "")' <<<"$input" 2>/dev/null) || sid=''
 if [[ -z ${CREW_AGENT:-} ]]; then
-  [[ -z $c ]] || line+=" · Claude 5h $c% · week ${cw:-unknown}%"
-  [[ -z $x ]] || line+=" · Codex 5h $x% · week ${xw:-unknown}%"
-  if [[ -n ${CLOUD_CREDIT_UNTIL:-} ]]; then
-    end=$(date -d "$CLOUD_CREDIT_UNTIL" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%SZ' "$CLOUD_CREDIT_UNTIL" +%s 2>/dev/null || echo 0)
+  for provider in Claude Codex; do
+    if [[ $provider == Claude ]]; then used=$c reset=$cr week=$cw weekreset=$cwr taken=$ct
+    else used=$x reset=$xr week=$xw weekreset=$xwr taken=$xt; fi
+    part=$(usage_window 5h "$used" "$reset")
+    if [[ -n $part ]]; then
+      line+=" · $provider $part"
+      part=$(usage_window week "$week" "$weekreset")
+      [[ -z $part ]] || line+=" · $part"
+      line+="$(usage_age "$taken")"
+    fi
+  done
+  credit=${CLOUD_CREDIT_UNTIL-}
+  if [[ -z ${CLOUD_CREDIT_UNTIL+x} && -f $HOME/.config/agent-kit/config ]]; then
+    while IFS= read -r config_line || [[ -n $config_line ]]; do
+      [[ $config_line != CLOUD_CREDIT_UNTIL=* ]] || credit=${config_line#*=}
+    done <"$HOME/.config/agent-kit/config"
+  fi
+  if [[ -n $credit ]]; then
+    end=$(date -d "$credit" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%SZ' "$credit" +%s 2>/dev/null || echo 0)
     balance=${XDG_DATA_HOME:-$HOME/.local/share}/cloud-runs/balance.tsv
-    if (( end > usage_now )) && [[ -s $balance ]]; then
-      line+=" · Cloud $(tail -1 "$balance" | cut -f2) ($(( (end-usage_now)/86400 ))d)"
+    if (( end >= usage_now )) && [[ -s $balance ]]; then
+      dollars=$(tail -1 "$balance" | cut -f2)
+      [[ ! $dollars =~ ^[0-9]+([.][0-9]+)?$ ]] || line+=" · Cloud \$${dollars%.*} ($(( (end-usage_now)/86400 ))d)"
     fi
   fi
+  if [[ ${c%.*} =~ ^[0-9]+$ && $cr =~ ^[0-9]+$ ]] && (( ${c%.*} >= ${PROMPT_CLOCK_LOW_AT:-80} && cr-usage_now > 3600 )); then
+    line+=$'\nUsage note: Claude 5h is low with over an hour to reset: prefer Sonnet/Codex or medium effort'
+  fi
+  read -r csid exp tokens < <(jq -r '[.session_id // "-",.prompt_cache.expires_at // "-",.prompt_cache.recache_tokens_if_cold // "-"]|map(tostring)|join(" ")' <<<"$snapshot")
+  if [[ -n $sid && $sid == "$csid" && $exp =~ ^[0-9]+$ && $tokens =~ ^[0-9]+$ ]] && (( exp <= usage_now && tokens >= 50000 )); then
+    line+=$'\n'"Usage note: prompt cache expired: this turn re-reads ~$(( tokens/1000 ))k tokens; if the earlier work is finished, suggest /clear or a handoff"
+  fi
 fi
+c=$(usage_percent "$c" "$cr"); cw=$(usage_percent "$cw" "$cwr")
+x=$(usage_percent "$x" "$xr"); xw=$(usage_percent "$xw" "$xwr")
 log=${XDG_DATA_HOME:-$HOME/.local/share}/usage-log/usage.tsv
 mkdir -p "${log%/*}"
-[[ -s $log ]] || printf 'time\tsession\tclaude_5h\tclaude_week\tcodex_5h\tcodex_week\n' >"$log"
-sid=$(jq -r '.session_id // "unknown" | gsub("[\\t\\r\\n]"; "")' <<<"$input" 2>/dev/null || echo unknown)
-printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${CREW_AGENT:+crew:}$sid" "$c" "$cw" "$x" "$xw" >>"$log"
+if [[ -s $log ]] && [[ $(awk -F '\t' 'NR==1 {print NF; exit}' "$log") != 7 ]]; then
+  rotated=${log%/*}/usage.$(date '+%Y%m%dT%H%M%S').tsv
+  suffix=0
+  while [[ -e $rotated ]]; do suffix=$((suffix+1)); rotated=${log%/*}/usage.$(date '+%Y%m%dT%H%M%S').$suffix.tsv; done
+  mv "$log" "$rotated"
+  printf 'Rotated usage log with incompatible header to %s\n' "$rotated" >&2
+fi
+[[ -s $log ]] || printf 'time\tsession\tclaude_5h\tclaude_week\tcodex_5h\tcodex_week\tcodex_as_of\n' >"$log"
+asof=''
+[[ $xt == 0 ]] || asof=$(iso_time "$xt")
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(iso_time)" "${CREW_AGENT:+crew:}${sid:0:8}" "$c" "$cw" "$x" "$xw" "$asof" >>"$log"
 jq -cn --arg c "$line" '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$c}}'

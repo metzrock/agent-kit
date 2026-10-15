@@ -1,3 +1,37 @@
+# Normalize only the executable, not arbitrary shell fragments.
+def executable:
+  sub("^ +"; "")
+  | if startswith("\"") then split("\"")[1]
+    elif startswith("'") then split("'")[1]
+    else split(" ")[0] end
+  | gsub("[\"']"; "") | gsub("\\$\\{HOME\\}|\\$HOME"; $home)
+  | sub("^~(?=/)"; $home);
+def commands: [.hooks[]?.command? | strings | executable];
+def same_script($a;$b):
+  $a==$b or (($a|contains("/")|not) and $a==($b|split("/")[-1]))
+  or (($b|contains("/")|not) and $b==($a|split("/")[-1]));
+def skipped_command: executable as $script | any($skipped[]; same_script(.;$script));
+def filtered_patch:
+  if (.statusLine.command? | type)=="string" and (.statusLine.command|skipped_command) then del(.statusLine) else . end
+  | if (.hooks?|type)=="object" then .hooks |= map_values(
+      if type=="array" then map(
+        if (.hooks?|type)=="array" then
+          .hooks |= map(select(if (.command?|type)=="string" then (.command|skipped_command|not) else true end))
+          | select(.hooks|length>0)
+        else . end)
+      else . end)
+    else . end;
+def additions($before;$v;$p):
+  if $p[0]=="hooks" then
+    [$before[] | commands[]] as $existing
+    | [$v[] | if (.hooks?|type)=="array" then
+        .hooks |= map(. as $hook | select(
+          if ($hook.command?|type)=="string" then
+            any($existing[]; same_script(.;($hook.command|executable)))|not
+          else true end))
+        | select(.hooks|length>0)
+      else . as $x | select($before|index($x)==null) end]
+  else [$v[] | . as $x | select($before|index($x)==null)] end;
 # Ownership tags live in state.json, never in Claude's settings schema.
 def leaves($p): if type=="object" then to_entries[] | .key as $k | .value | leaves($p+[$k]) else $p end;
 def leafpaths: leaves([]);
@@ -14,15 +48,24 @@ def undo($e):
     if $e.present then setpath($e.path;$e.before)
     else delpaths([$e.path]) | clean($e) end
   else . end;
-{document:.,entries:$journal}
+($patch|filtered_patch) as $filtered
+| {document:.,entries:$journal}
 | if $mode=="remove" then
     reduce ($journal[]|select(.module==$module)) as $e (.; .document |= undo($e))
     | reduce ($journal[]|select(.module==$module)) as $e (.; .document |= clean($e))
     | .entries |= map(select(.module!=$module))
   else
-    reduce ($patch|leafpaths) as $p (.;
-      ($patch|getpath($p)) as $v
-      | .document as $doc
+    # Remove only kit-owned statusLine leaves when its executable was skipped.
+    if ($patch|has("statusLine")) and ($filtered|has("statusLine")|not) then
+      reduce (.entries[]|select(.module==$module and .path[0]=="statusLine")) as $e (.; .document |= undo($e))
+      | reduce (.entries[]|select(.module==$module and .path[0]=="statusLine")) as $e (.; .document |= clean($e))
+      | .entries |= map(select(.module!=$module or .path[0]!="statusLine"))
+    else . end
+    | reduce ($filtered|leafpaths) as $p (.;
+      ($filtered|getpath($p)) as $v
+      | if $p[0]=="statusLine" and (.document|has("statusLine")) and
+          ([.entries[]|select(.path[0]=="statusLine")]|length)==0 then . else
+      .document as $doc
       | if any(range(1; $p|length); . as $n | ($doc|getpath($p[0:$n])) as $parent | $parent!=null and ($parent|type)!="object") then error("settings parent conflicts with user value") else . end
       | ([.entries[]|select(.module==$module and .path==$p)][0]) as $old
       | if $old != null then
@@ -35,9 +78,9 @@ def undo($e):
             | ($s.document|getpath($p)) as $before
             | ($s.document|any(paths; .==$p)) as $present
             | if ($v|type)=="array" then
-                (reduce $v[] as $x (($before // []); if index($x)!=null then . else .+[$x] end)) as $after
+                (($before // []) + additions(($before // []);$v;$p)) as $after
                 | .document |= setpath($p;$after)
-                | .entries += [{module:$module,path:$p,parents:$parents,array:true,present:$present,added:($v-($before // []))}]
+                | .entries += [{module:$module,path:$p,parents:$parents,array:true,present:$present,added:additions(($before // []);$v;$p)}]
               else .document |= setpath($p;$v)
                 | .entries += [{module:$module,path:$p,parents:$parents,array:false,present:$present,before:$before,value:$v}] end
           end
@@ -47,10 +90,10 @@ def undo($e):
           | (.document|any(paths; .==$p)) as $present
           | if ($v|type)=="array" then
               if $before!=null and ($before|type)!="array" then error("settings array conflicts with user value") else
-              .document |= setpath($p;(reduce $v[] as $x (($before // []); if index($x)!=null then . else .+[$x] end)))
-              | .entries += [{module:$module,path:$p,parents:$parents,array:true,present:$present,added:($v-($before // []))}] end
+              .document |= setpath($p;(($before // []) + additions(($before // []);$v;$p)))
+              | .entries += [{module:$module,path:$p,parents:$parents,array:true,present:$present,added:additions(($before // []);$v;$p)}] end
             elif $present then .
             else .document |= setpath($p;$v)
               | .entries += [{module:$module,path:$p,parents:$parents,array:false,present:false,before:null,value:$v}] end
-        end)
+        end end)
   end

@@ -17,12 +17,26 @@ navigate_pane_up = "up"
 navigate_pane_right = "right"
 split_horizontal = "prefix+minus"
 split_vertical = "prefix+v"
+new_tab = "prefix+c"
+next_tab = "prefix+n"
+previous_tab = "prefix+p"
+detach = "prefix+q"
+close_pane = "prefix+x"
+close_tab = "prefix+ampersand"
+workspace_picker = "prefix+w"
+goto = "prefix+g"
+copy_mode = "prefix+y"
 [ui]
 mouse_capture = true
 agent_panel_sort = "spaces"
 mobile_width_threshold = 80
 window_title = "{workspace}: {tab}"
 status_indicators = "symbols"
-tab_bar_right = [{ type = "datetime", format = "%H:%M" }]
+tab_bar_right = [{ type = "command", command = "~/.local/bin/usage-status", interval_seconds = 60, timeout_seconds = 5 }, { type = "datetime", format = "%H:%M" }]
 [ui.sidebar.spaces]
-rows = [["state_icon", "workspace"], ["branch", "git_status"], [{ token = "$crew", fg = "#f6c177" }]]
+rows = [["state_icon", "workspace"], ["branch", "git_status"], [{ token = "$crew", fg = "#f6c177", rules = [
+  { starts_with = "usage limit", fg = "#eb6f92", bold = true },
+  { starts_with = "blocked", fg = "#eb6f92", bold = true },
+  { starts_with = "stalled", fg = "#eb6f92" },
+  { starts_with = "✓", fg = "#9ccfd8", bold = true },
+] }]]

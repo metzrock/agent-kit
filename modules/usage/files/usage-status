@@ -13,6 +13,6 @@ for pair in "Claude $c $cr" "Codex $x $xr"; do
   parts+=("$text")
 done
 if [[ ${#parts[@]} -gt 0 ]]; then
-  text=${parts[0]}; for part in "${parts[@]:1}"; do text+=" · $part"; done
+  text=${parts[0]}; for part in ${parts[@]+"${parts[@]:1}"}; do text+=" · $part"; done
   printf '%s\n' "$text"
 fi
