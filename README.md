@@ -29,6 +29,8 @@ These install tools and skills written by other people. They are left out of a p
 | writing | Writing and planning skills: humanizer (rewrites text that sounds AI-written), grill-me and handoff, plus the i-have-adhd plugin. |
 | devtools | Helpers that let Claude work with GitHub (gh-axi) and Chrome (chrome-devtools-axi), rtk for shorter command output, and Cloudflare's plugin. |
 
+![Installing the writing add-on: the kit shows the source and exact command, asks first, then installs the humanizer skill](docs/demo/addons.gif)
+
 ## The quick way: let Claude install it
 
 If you already have Claude Code, the easiest start is to open it and paste in the contents of [GIVE_THIS_TO_YOUR_AGENT.md](GIVE_THIS_TO_YOUR_AGENT.md). Claude then checks your system, asks which modules you want and which model to use day to day, shows each command before it runs it, installs the kit, runs the checkup and offers the interview described in [Make it yours](#make-it-yours). It never reads your login or keys.
