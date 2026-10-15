@@ -45,8 +45,8 @@ install_modules() {
     names=(base)
     for name in ${requested[@]+"${requested[@]}"}; do
       load_module "$name"
-      [[ $name != crew ]] || names+=(lean)
-      names+=("$name")
+      [[ $name != crew || " ${names[*]} " == *' lean '* ]] || names+=(lean)
+      [[ " ${names[*]} " == *" $name "* ]] || names+=("$name")
     done
   fi
   if (( dry )); then printf 'Would install: %s (model: %s)\n' "${names[*]}" "$MODEL"; return; fi
