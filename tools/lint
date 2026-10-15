@@ -3,6 +3,6 @@ set -euo pipefail
 files=()
 while IFS= read -r -d '' file; do
   case "$file" in *.bats) continue ;; esac
-  if [[ $(head -1 "$file") == '#!/usr/bin/env bash' ]]; then files+=("$file"); fi
+  if [[ $(head -1 "$file" | tr -d '\0') == '#!/usr/bin/env bash' ]]; then files+=("$file"); fi
 done < <(git ls-files --cached --others --exclude-standard -z)
 shellcheck -x ${files[@]+"${files[@]}"}

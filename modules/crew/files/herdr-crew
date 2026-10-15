@@ -464,7 +464,7 @@ cmd_merge() {
   if [ -s "$patch" ] && ! git -C "$WORKTREE" apply --binary --check "$patch" 2>"$RUN/.apply-err"; then ok=0; fi
   pane=$(agent_field "$IMPL_B" pane_id)
   quit_agent "$IMPL_B" || true
-  [ -n "$pane" ] && herdr pane close "$pane" >/dev/null 2>&1 || true
+  if [ -n "$pane" ]; then herdr pane close "$pane" >/dev/null 2>&1 || true; fi
   git -C "$REPO" worktree remove --force "$WORKTREE_B"
   if [ "$ok" = 0 ]; then
     step "blocked: parts overlap"
@@ -698,8 +698,9 @@ cloud_job() { # <new|follow-up> <kind> <model> <report-stem> <step-while-working
 # Before the final commit: take the cloud's last pushes, drop .cloud/, and fold the
 # branch's commits back into the working tree so the task ends as one commit.
 cloud_squash() {
-  git -C "$WORKTREE" fetch -q origin "$BRANCH" 2>/dev/null &&
+  if git -C "$WORKTREE" fetch -q origin "$BRANCH" 2>/dev/null; then
     git -C "$WORKTREE" merge -q --ff-only "origin/$BRANCH" 2>/dev/null || true
+  fi
   git -C "$WORKTREE" rm -r -q --ignore-unmatch .cloud
   rm -rf "$WORKTREE/.cloud"
   git -C "$WORKTREE" reset -q --soft "$BASE"

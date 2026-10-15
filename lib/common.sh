@@ -153,7 +153,7 @@ uninstall_module() {
 }
 cleanup_state() {
   local dir
-  while IFS= read -r dir; do safe_destination "$dir" && rmdir "$dir" 2>/dev/null || true; done < <(jq -r '.dirs|reverse[]' "$KIT_STATE")
+  while IFS= read -r dir; do if safe_destination "$dir"; then rmdir "$dir" 2>/dev/null || true; fi; done < <(jq -r '.dirs|reverse[]' "$KIT_STATE")
   if [[ $(jq '(.modules + (.pending_modules // []))|length' "$KIT_STATE") == 0 ]]; then
     rm "$KIT_STATE"
     rmdir "$KIT_CONFIG" "$HOME/.config" 2>/dev/null || true

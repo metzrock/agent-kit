@@ -13,7 +13,7 @@ if [[ -z ${AGENT_KIT_USAGE_CACHE:-} && ! -e $usage_cache && -d $legacy_cache ]];
     staging=$(mktemp -d "$parent/.usage-migration.XXXXXX")
     trap 'rm -rf "$staging"' EXIT
     mkdir "$staging/$name"
-    cp -R "$legacy_cache/." "$staging/$name/" && mv "$staging/$name" "$parent/" 2>/dev/null || true
+    if cp -R "$legacy_cache/." "$staging/$name/"; then mv "$staging/$name" "$parent/" 2>/dev/null || true; fi
   )
   migrate_usage_cache
 fi

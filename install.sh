@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Public bootstrap: resolve a release, then run its installer.
 set -euo pipefail
-repo=https://github.com/OWNER/agent-kit
+repo=https://github.com/metzrock/agent-kit
 kit_dir=$HOME/.local/share/agent-kit
 for cmd in git bash; do command -v "$cmd" >/dev/null || { echo "$cmd is required" >&2; exit 1; }; done
 if [[ -e $kit_dir || -L $kit_dir ]]; then

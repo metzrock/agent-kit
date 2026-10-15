@@ -140,7 +140,7 @@ printf '%s\n' "$*" >>"$HOME/git-commands"
 if [[ $1 == clone ]]; then
   mkdir -p "$3/.git" "$3/bin"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >"$HOME/kit-args"' >"$3/bin/agent-kit"
-elif [[ $* == *'remote get-url origin'* ]]; then echo "${MOCK_ORIGIN:-https://github.com/OWNER/agent-kit}"
+elif [[ $* == *'remote get-url origin'* ]]; then echo "${MOCK_ORIGIN:-https://github.com/metzrock/agent-kit}"
 elif [[ $* == *'status --porcelain'* ]]; then printf '%s' "${MOCK_DIRTY:-}"
 elif [[ $* == *'tag --list'* ]]; then printf 'v2.0.0\nv1.0.0\n'
 fi
