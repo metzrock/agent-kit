@@ -127,6 +127,16 @@ start_agent() { # <kind> <name> <pane> <cwd> <agent args...>
     local extra=() profile=() config=${CODEX_HOME:-$HOME/.codex}/config.toml section
     [[ -z $CREW_IMPL_PROFILE ]] || profile=(-p "$CREW_IMPL_PROFILE")
     read -r -a extra <<<"$CREW_CODEX_ARGS"
+    if [[ " ${extra[*]-} " == *" --approve-for-me "* ]]; then
+      # --approve-for-me implies the workspace-write sandbox, and Codex refuses it next to --sandbox.
+      local kept=() skip=0 arg
+      for arg in "$@"; do
+        if ((skip)); then skip=0; continue; fi
+        if [[ $arg == --sandbox ]]; then skip=1; continue; fi
+        kept+=("$arg")
+      done
+      set -- ${kept[@]+"${kept[@]}"}
+    fi
     set -- ${profile[@]+"${profile[@]}"} ${extra[@]+"${extra[@]}"} "$@"
     if [[ $CREW_CODEX_AUTO_TRUST == 1 ]]; then
       section="[projects.$(jq -Rn --arg r "$root" '$r')]"

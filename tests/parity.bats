@@ -141,6 +141,8 @@ MOCK
   run "$KIT_ROOT/modules/crew/files/herdr-crew" up
   [[ $status == 0 ]]
   grep -q -- '-- -p custom --approve-for-me --example -c' "$HOME/commands"
+  run grep -q -- '--sandbox' "$HOME/commands"
+  [[ $status == 1 ]]
   grep -q 'Extra generic rule' "$HOME/commands"
   [[ ! -e $CODEX_HOME/config.toml ]]
   export CREW_IMPL_PROFILE=override
@@ -159,6 +161,7 @@ MOCK
   sed -i 's/"trusted"/"untrusted"/' "$CODEX_HOME/config.toml"
   "$KIT_ROOT/modules/crew/files/herdr-crew" up >/dev/null
   grep -q 'trust_level = "untrusted"' "$CODEX_HOME/config.toml"
+  grep -q -- '--sandbox workspace-write' "$HOME/commands"
 }
 @test "second implementer and Codex reviewer both receive profile and extra arguments" {
   crew_double
