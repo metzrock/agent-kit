@@ -1,1 +1,2 @@
 CREW_IMPLEMENTER=sonnet
+# CREW_HELPER=codex requires CREW_IMPLEMENTER=codex; default helper is sonnet.

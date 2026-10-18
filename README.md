@@ -196,7 +196,7 @@ To set it up, install crew with `--upstream` so the kit can install Herdr too (o
 bin/agent-kit install --modules crew --upstream
 ```
 
-Then start Claude Code inside a Herdr pane and ask it to use the crew. The helper that writes code is Sonnet by default. If you also use OpenAI's Codex, you can switch it by changing `CREW_IMPLEMENTER` in `~/.config/agent-kit/config`.
+Then start Claude Code inside a Herdr pane and ask it to use the crew. The helper that writes code is Sonnet by default. If you also use OpenAI's Codex, you can switch it by changing `CREW_IMPLEMENTER` in `~/.config/agent-kit/config`. Set `CREW_HELPER=codex` alongside `CREW_IMPLEMENTER=codex` to use Codex for scouts and reviews too, with a final adversarial review by the lead.
 
 The kit's Herdr settings turn on arrow keys and mouse support. The keys to start with: press `ctrl+b`, then an arrow key to move between panes, or `ctrl+b`, then `v` to split the screen.
 

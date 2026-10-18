@@ -143,7 +143,7 @@ MOCK
   grep -q -- '-- -p custom --approve-for-me --example -c' "$HOME/commands"
   run grep -q -- '--sandbox' "$HOME/commands"
   [[ $status == 1 ]]
-  grep -q 'Extra generic rule' "$HOME/commands"
+  grep -q 'Extra generic rule' "$HOME/state/sonnet-role.md"
   [[ ! -e $CODEX_HOME/config.toml ]]
   export CREW_IMPL_PROFILE=override
   "$KIT_ROOT/modules/crew/files/herdr-crew" up >/dev/null

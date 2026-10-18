@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# herdr-crew: drive Codex implementers and a Sonnet helper (scout, reviewer, backup
+# herdr-crew: drive implementers and Sonnet or Codex helpers (scout, reviewer, backup
 # coder) in sibling Herdr panes on behalf of an orchestrating agent (Claude Code /
 # Opus). One task at a time per Herdr workspace; each task gets its own git
 # worktree and branch.
@@ -7,15 +7,16 @@
 #   herdr-crew task [--cloud] <slug>  new Herdr worktree workspace on branch crew/<slug>, agents in it;
 #                                     --cloud: the cloud lane (no local agents; every job below
 #                                     runs as a Claude Code cloud session, via cloud-run)
-#   herdr-crew scout [--model M] [--effort E] <brief>
-#                                     have Sonnet map the code for planning (brief: file or text);
+#   herdr-crew scout [--by sonnet|codex] [--model M] [--effort E] <brief>
+#                                     have the helper map the code for planning (brief: file or text);
 #                                     --model haiku runs this scout on Haiku 5.5 instead
 #   herdr-crew implement [--by sonnet|cloud] [--model sonnet|opus] <spec.md> [<spec-b.md>]
 #                                     hand the spec to the implementer and wait; with two specs a
 #                                     second Codex implementer builds part B in its own checkout,
 #                                     then part B is merged into the task worktree
-#   herdr-crew review [--by codex|cloud]  have Sonnet (or a fresh Codex agent, high effort, or a
-#                                     fresh cloud session) review the diff
+#   herdr-crew review [--by sonnet|codex|cloud]
+#                                     review with CREW_HELPER (default Sonnet), a fresh Codex
+#                                     agent at high effort, or a fresh cloud session
 #   herdr-crew fix [--by sonnet|cloud] <findings.md>
 #                                     hand review findings back to the implementer and wait
 #   herdr-crew merge                  retry merging part B into the task worktree
@@ -33,12 +34,15 @@
 # the default cloud model, CREW_CLOUD_TIMEOUT (7200s) how long to wait for a report.
 # Env: CREW_IMPL_EFFORT (default medium), CREW_REVIEW_EFFORT (default high); for parallel
 # tasks from one lead, give each its own CREW_STATE_DIR and CREW_*_NAME agent names.
+# CREW_HELPER (sonnet|codex, default sonnet) selects scouts and reviewers.
+# CREW_SCOUT_CODEX_EFFORT (medium), CREW_SCOUT_NAME (scout) configure Codex scouts.
+# CREW_ALLOW_SONNET=1 permits explicit Sonnet jobs in a Codex-only crew.
 # Exit codes: 0 ok, 3 agent blocked on a dialog, 4 agent settled without a report,
 # 5 usage limit reached (Codex, or Claude for Sonnet), 6 part B overlaps part A.
 set -euo pipefail
 
 # Read configuration as data; environment values take precedence.
-for config_key in CREW_IMPLEMENTER CREW_IMPL_PROFILE CREW_CODEX_ARGS CREW_CODEX_AUTO_TRUST CREW_SONNET_NOTE; do
+for config_key in CREW_HELPER CREW_IMPLEMENTER CREW_IMPL_PROFILE CREW_CODEX_ARGS CREW_CODEX_AUTO_TRUST CREW_SONNET_NOTE; do
   config_value=''
   if [[ -f $HOME/.config/agent-kit/config ]]; then
     while IFS= read -r config_line || [[ -n $config_line ]]; do
@@ -48,8 +52,13 @@ for config_key in CREW_IMPLEMENTER CREW_IMPL_PROFILE CREW_CODEX_ARGS CREW_CODEX_
   [[ -n ${!config_key+x} ]] || printf -v "$config_key" '%s' "$config_value"
 done
 CREW_IMPLEMENTER=${CREW_IMPLEMENTER:-sonnet}
+CREW_HELPER=${CREW_HELPER:-sonnet}
 CREW_CODEX_AUTO_TRUST=${CREW_CODEX_AUTO_TRUST:-0}
 case "$CREW_IMPLEMENTER" in sonnet|codex) ;; *) echo 'CREW_IMPLEMENTER must be sonnet or codex' >&2; exit 1 ;; esac
+case "$CREW_HELPER" in sonnet|codex) ;; *) echo 'CREW_HELPER must be sonnet or codex' >&2; exit 1 ;; esac
+if [[ $CREW_HELPER == codex && $CREW_IMPLEMENTER != codex ]]; then
+  echo 'CREW_HELPER=codex requires CREW_IMPLEMENTER=codex' >&2; exit 1
+fi
 # Only option values select the cloud lane; a slug or filename can be cloud.
 previous=''
 for arg in "$@"; do
@@ -66,7 +75,9 @@ IMPL_EFFORT=${CREW_IMPL_EFFORT:-medium}
 # Codex optional reviewer: a fresh agent each round, quit afterwards.
 REVIEWER=${CREW_REVIEWER_NAME:-reviewer}
 REVIEW_EFFORT=${CREW_REVIEW_EFFORT:-high}
-case "$IMPL_EFFORT $REVIEW_EFFORT" in *xhigh*|*max*) echo "herdr-crew: effort above high is not allowed" >&2; exit 1 ;; esac
+SCOUT=${CREW_SCOUT_NAME:-scout}
+SCOUT_CODEX_EFFORT=${CREW_SCOUT_CODEX_EFFORT:-medium}
+case "$IMPL_EFFORT $REVIEW_EFFORT $SCOUT_CODEX_EFFORT" in *xhigh*|*max*) echo "herdr-crew: effort above high is not allowed" >&2; exit 1 ;; esac
 SONNET_MODEL=${CREW_SONNET_MODEL:-sonnet}
 SONNET_EFFORT=${CREW_SONNET_EFFORT:-medium}
 # Scouts can use Haiku for small mapping tasks.
@@ -189,11 +200,28 @@ quit_agent() { # <name>; fails if the agent is still running
 start_sonnet() { # <pane> <cwd> [model] [effort]
   local model effort=${4:-$SONNET_EFFORT}
   model=$(model_id "${3:-$SONNET_MODEL}")
+  # Herdr rejects newlines in argv; notes can add them to the standing orders.
+  printf '%s\n' "$SONNET_ROLE" >"$STATE_DIR/sonnet-role.md"
   start_agent claude "$SONNET" "$1" "$2" --model "$model" --effort "$effort" \
     --permission-mode auto --add-dir "$STATE_DIR" --disallowedTools Agent \
     --settings '{"env":{"CREW_AGENT":"sonnet"}}' \
-    --append-system-prompt "$SONNET_ROLE" -n "crew $SONNET"
+    --append-system-prompt-file "$STATE_DIR/sonnet-role.md" -n "crew $SONNET"
   echo "$model $effort" >"$STATE_DIR/sonnet-model"
+}
+
+allow_sonnet() {
+  [[ $CREW_HELPER != codex || ${CREW_ALLOW_SONNET:-0} == 1 ]] ||
+    die 'CREW_HELPER=codex keeps Claude out of the crew; on a Codex usage limit, commit wip and wait for the reset (or rerun with CREW_ALLOW_SONNET=1)'
+}
+
+ensure_sonnet() { # [model] [effort]
+  allow_sonnet
+  if ! agent_live "$SONNET"; then
+    local pane cwd=${WORKTREE:-$PWD}
+    pane=$(split_pane "$(agent_field "$IMPL" pane_id)" down "$cwd")
+    echo "$pane" >>"$PANES_FILE"
+    start_sonnet "$pane" "$cwd" "$@"
+  fi
 }
 
 model_id() { [ "$1" = haiku ] && echo claude-haiku-5-5 || echo "$1"; }
@@ -202,6 +230,7 @@ model_id() { [ "$1" = haiku ] && echo claude-haiku-5-5 || echo "$1"; }
 # If it's on another model or effort than the job wants (e.g. after a Haiku scout),
 # restart it on the right one instead, which is a clean context too.
 sonnet_fresh() { # [model] [effort]
+  ensure_sonnet "$@"
   local want have pane cwd
   want="$(model_id "${1:-$SONNET_MODEL}") ${2:-$SONNET_EFFORT}"
   have=$(cat "$STATE_DIR/sonnet-model" 2>/dev/null || echo "$(model_id "$SONNET_MODEL") $SONNET_EFFORT")
@@ -220,6 +249,7 @@ cmd_up() {
   if cloud_on; then echo "cloud lane: no local agents"; cmd_status; return; fi
   local cwd=${WORKTREE:-$PWD} impl_pane son_pane width n live_cwd
   for n in "$IMPL" "$SONNET"; do
+    [[ $n != "$SONNET" || $CREW_HELPER != codex ]] || continue
     live_cwd=$(agent_field "$n" cwd)
     if [ -n "$live_cwd" ] && [ "$live_cwd" != "$cwd" ]; then
       die "$n is running in $live_cwd, not $cwd; run 'herdr-crew down' first"
@@ -243,7 +273,7 @@ cmd_up() {
         --sandbox workspace-write
     fi
   fi
-  if ! agent_live "$SONNET"; then
+  if [[ $CREW_HELPER != codex ]] && ! agent_live "$SONNET"; then
     impl_pane=$(agent_field "$IMPL" pane_id)
     son_pane=$(split_pane "$impl_pane" down "$cwd")
     echo "$son_pane" >>"$PANES_FILE"
@@ -408,6 +438,7 @@ cmd_implement() {
   done
   case "$by" in codex|sonnet|cloud) ;; *) die "--by takes codex, sonnet or cloud" ;; esac
   [[ $by != codex || $CREW_IMPLEMENTER == codex ]] || die 'Set CREW_IMPLEMENTER=codex to use a Codex implementer'
+  [[ $by != sonnet ]] || allow_sonnet
   local spec=${1:-} spec_b=${2:-}
   [ -f "$spec" ] || die "usage: herdr-crew implement [--by sonnet|cloud] [--model sonnet|opus] <spec.md> [<spec-b.md>]"
   if [[ -n $spec_b && ( $CREW_IMPLEMENTER != codex || $by != codex ) ]]; then
@@ -498,6 +529,7 @@ cmd_fix() {
   cloud_on && by=cloud
   case "$by" in codex) ;; sonnet) [[ $CREW_IMPLEMENTER == sonnet ]] || agent=$SONNET ;; cloud) ;; *) die "--by takes codex, sonnet or cloud" ;; esac
   [[ $by != codex || $CREW_IMPLEMENTER == codex ]] || die 'Set CREW_IMPLEMENTER=codex to use a Codex implementer'
+  [[ $by != sonnet ]] || allow_sonnet
   local findings=${1:-}; [ -f "$findings" ] || die "usage: herdr-crew fix [--by sonnet|cloud] <findings.md>"
   local n=1; while [ -e "$RUN/fix-$n.md" ] || [ -e "$RUN/findings-$n.md" ]; do n=$((n + 1)); done
   cp "$findings" "$RUN/findings-$n.md"
@@ -508,23 +540,33 @@ cmd_fix() {
 "First run: git pull origin $BRANCH (the crew pushed code review findings to .cloud/findings-$n.md). Fix every MUST-FIX; for the rest use judgment and say what you decided. Re-run only the tests related to the fixes, then the full suite once at the end. Commit the fixes. The report lists each finding and how it was resolved, plus test results."
     return
   fi
+  [[ $agent != "$SONNET" ]] || ensure_sonnet
   prompt_and_wait "$agent" "$RUN/fix-$n.md" "fix round $n ($by)" "fixed, re-checking" \
 "Code review findings for this change are in $RUN/findings-$n.md. Work in $WORKTREE. Fix every MUST-FIX; for the rest use judgment and say what you decided. Re-run only the tests related to the fixes, then the full suite once at the end, waiting for long commands in a single call. Do not commit. Write a concise Markdown report to $RUN/fix-$n.md listing each finding and how it was resolved, plus test results. Then reply only with the report path."
 }
 
 cmd_scout() {
   need_task
-  local model=$SCOUT_MODEL effort=$SCOUT_EFFORT
+  local by=$CREW_HELPER model=$SCOUT_MODEL effort=$SCOUT_EFFORT model_set=0 effort_set=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --model) model=${2:?--model needs a value}; shift 2 ;;
-      --effort) effort=${2:?--effort needs a value}; shift 2 ;;
+      --by) by=${2:?--by takes sonnet or codex}; shift 2 ;;
+      --model) model=${2:?--model needs a value}; model_set=1; shift 2 ;;
+      --effort) effort=${2:?--effort needs a value}; effort_set=1; shift 2 ;;
       *) break ;;
     esac
   done
+  case "$by" in sonnet|codex) ;; *) die "--by takes sonnet or codex" ;; esac
+  if ! cloud_on; then
+    if [[ $by == codex ]]; then
+      [[ $model_set == 0 ]] || die '--model is not supported with --by codex'
+      [[ $effort_set == 1 ]] || effort=$SCOUT_CODEX_EFFORT
+      case "$effort" in low|medium|high) ;; *) die 'Codex scout effort must be low, medium or high; effort above high is not allowed' ;; esac
+    else allow_sonnet; fi
+  fi
   local brief=${1:-}
-  [ -n "$brief" ] || die "usage: herdr-crew scout [--model M] [--effort E] <brief.md | \"what to look into\">"
-  local stem=scout; [ "$model" = "$SONNET_MODEL" ] || stem=scout-$model
+  [ -n "$brief" ] || die "usage: herdr-crew scout [--by sonnet|codex] [--model M] [--effort E] <brief.md | \"what to look into\">"
+  local stem=scout; [[ $by == codex && $LANE != cloud || $model == "$SONNET_MODEL" ]] || stem=scout-$model
   local report; report=$(next_path "$RUN" "$stem")
   if [ -f "$brief" ]; then cp "$brief" "${report%.md}-brief.md"
   else printf '%s\n' "$*" >"${report%.md}-brief.md"; fi
@@ -535,6 +577,23 @@ cmd_scout() {
       "$(scout_prompt ".cloud/$name-brief.md" ".cloud/$name.md") Do NOT modify any repository files other than the report."
     return
   fi
+  if [[ $by == codex ]]; then
+    # Keep cleanup outside the subshell: prompt/start failures may exit directly.
+    local pane rc=0
+    pane=$(split_pane "$(agent_field "$IMPL" pane_id)" down "$WORKTREE")
+    echo "$pane" >>"$PANES_FILE"
+    (
+      set -e
+      start_agent codex "$SCOUT" "$pane" "$WORKTREE" -c "model_reasoning_effort=\"$effort\"" --sandbox workspace-write
+      prompt_and_wait "$SCOUT" "$report" "scouting (codex)" "scouted, planning" \
+        "$(scout_prompt "${report%.md}-brief.md" "$report") Do NOT modify any files. Then reply only with the report path."
+    ) &
+    local scout_pid=$!
+    wait "$scout_pid" || rc=$?
+    quit_agent "$SCOUT" || true
+    herdr pane close "$pane" >/dev/null 2>&1 || true
+    return "$rc"
+  fi
   sonnet_fresh "$model" "$effort"
   prompt_and_wait "$SONNET" "$report" "scouting ($model)" "scouted, planning" \
     "$(scout_prompt "${report%.md}-brief.md" "$report") Do NOT modify any files. Then reply only with the report path."
@@ -542,15 +601,16 @@ cmd_scout() {
 
 scout_prompt() { # <brief-path> <report-path>
   printf '%s' \
-"Opus is planning a coding task in this repo and will not read the code itself, so it relies on your map. The task brief is in $1. Read only what you need. Write a Markdown report to $2, at most about 100 lines, with these sections: Relevant code (each file and function with file:line and a one-line purpose); How it fits together (data flow, call paths, existing patterns to follow); Tests (where they live, the exact commands to run them; do NOT run the tests yourself); Constraints and gotchas (conventions, config, anything easy to break); Risk (does it touch auth, secrets, data deletion or migration, concurrency, or network-exposed services); Size (rough lines changed and number of files); Split (can the work be built as two parts that change no file in common, tests included, with neither part needing code the other is still writing? If yes, list each part's files; if no, say why). Quote code only in short snippets."
+"The lead is planning a coding task in this repo and will not read the code itself, so it relies on your map. The task brief is in $1. Read only what you need. Write a Markdown report to $2, at most about 100 lines, with these sections: Relevant code (each file and function with file:line and a one-line purpose); How it fits together (data flow, call paths, existing patterns to follow); Tests (where they live, the exact commands to run them; do NOT run the tests yourself); Constraints and gotchas (conventions, config, anything easy to break); Risk (does it touch auth, secrets, data deletion or migration, concurrency, or network-exposed services); Size (rough lines changed and number of files); Split (can the work be built as two parts that change no file in common, tests included, with neither part needing code the other is still writing? If yes, list each part's files; if no, say why). Quote code only in short snippets."
 }
 
 cmd_review() {
   need_task
-  local by=sonnet
+  local by=$CREW_HELPER
   cloud_on && by=cloud
-  case "${1:-}" in --by) by=${2:?--by takes sonnet, codex or cloud} ;; "") ;; *) die "usage: herdr-crew review [--by codex|cloud]" ;; esac
+  case "${1:-}" in --by) by=${2:?--by takes sonnet, codex or cloud} ;; "") ;; *) die "usage: herdr-crew review [--by sonnet|codex|cloud]" ;; esac
   case "$by" in sonnet|codex|cloud) ;; *) die "--by takes sonnet, codex or cloud" ;; esac
+  [[ $by != sonnet ]] || allow_sonnet
   local n=1; while [ -e "$RUN/review-$n.md" ]; do n=$((n + 1)); done
   local where=$RUN; [ "$by" = cloud ] && where=.cloud
   local earlier=""
@@ -741,6 +801,10 @@ cmd_status() {
   local n
   for n in "$IMPL" "$IMPL_B" "$SONNET"; do
     if [ "$n" = "$IMPL_B" ] && ! agent_live "$n"; then continue; fi
+    if [[ $n == "$SONNET" && $CREW_HELPER == codex ]] && ! agent_live "$n"; then
+      printf '%-14s %s\n' "$n" 'not used (CREW_HELPER=codex)'
+      continue
+    fi
     printf '%-14s %s\n' "$n" "$(herdr agent get "$n" 2>/dev/null | jq -r '.result.agent | "\(.agent_status)  pane=\(.pane_id)"' || echo missing)"
   done
 }

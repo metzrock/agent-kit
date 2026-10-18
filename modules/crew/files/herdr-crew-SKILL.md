@@ -1,6 +1,6 @@
 ---
 name: herdr-crew
-description: "Orchestrate a coding task in Herdr with a Sonnet scout and reviewer and a Sonnet or Codex implementer, ending with a reviewed commit on a task branch. Use when asked to use the crew, delegate implementation, or run /herdr-crew. Requires a Herdr pane."
+description: "Orchestrate a coding task in Herdr with Sonnet or Codex scouts, reviewers, and implementers, ending with a reviewed commit on a task branch. Use when asked to use the crew, delegate implementation, or run /herdr-crew. Requires a Herdr pane."
 argument-hint: "<task description>"
 ---
 
@@ -21,7 +21,7 @@ marks completion. The script updates the step around its own jobs.
 | Role | Model or agent |
 |---|---|
 | Lead: plan, spec, decisions, commit | This session's model |
-| Scout and fresh reviewer | Sonnet, agent `sonnet` |
+| Scout and fresh reviewer | Sonnet, or Codex with `CREW_HELPER=codex` |
 | Implementer | Sonnet or Codex, according to `CREW_IMPLEMENTER` (default Sonnet) |
 | Second implementer | Codex, agent `implementer-b` |
 | Backup coder when Codex is unavailable | Sonnet |
@@ -31,7 +31,7 @@ marks completion. The script updates the step around its own jobs.
 The lead does not read source, diffs, or test output and does not rerun tests.
 Use scout and reviewer reports. One targeted read of about 50 lines is allowed
 when a report leaves one specific question unresolved or appears wrong.
-Sonnet scouts and reviews; it codes only when selected as implementer or backup.
+The helper scouts and reviews; Sonnet codes only when selected as implementer or backup.
 Keep Codex effort at medium unless the task warrants high; never above high.
 Write complete specs and batch accepted findings into one fix round.
 
@@ -77,7 +77,7 @@ State the lane and implementer count, with a short reason.
 5. Run `herdr-crew implement <spec>` (or `<spec-a> <spec-b>`) with
    `run_in_background: true`, then wait for notification without polling.
    Part B uses its own checkout and is merged into the task worktree afterward.
-6. Run `herdr-crew review` with `run_in_background: true`. The fresh Sonnet
+6. Run `herdr-crew review` with `run_in_background: true`. The fresh helper
    reviewer checks the real diff against the specs, runs checks, and reports
    self-contained findings with severity, confidence, location, excerpt, and a
    concrete failure scenario. Decide from that evidence; explain rejected findings.
@@ -95,6 +95,19 @@ State the lane and implementer count, with a short reason.
 
 Run long scout, implement, review, and fix commands with `run_in_background: true`
 when the tool supports it; wait for completion notification instead of polling.
+
+## Codex-only crew
+
+Set `CREW_HELPER=codex` and `CREW_IMPLEMENTER=codex` for Codex in every worker
+role. The lead plans, writes specs, and decides. Before accepting each Codex
+review or committing, the lead does a **final adversarial review**: check every
+MUST-FIX and SHOULD-FIX claim against the code with targeted reads; reject false
+positives with reasons. Look for missed problems in the riskiest hunks: state
+machines, limits, error paths, and anything the spec flagged. Check each spec
+verification item against evidence in the reports. The no-source/no-diff budget
+rule is relaxed only for this step, limited to those risky parts.
+On a Codex usage limit, commit `wip:` and wait for reset instead of using Sonnet.
+Explicit Sonnet jobs require `CREW_ALLOW_SONNET=1`; they start Sonnet on demand.
 
 ## Sonnet as backup coder
 
