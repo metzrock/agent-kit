@@ -78,6 +78,7 @@ MOCK
 }
 @test "prompt clock exact format and seven column log include reset stale cloud and notes" {
   clock_fixture
+  export PROMPT_CLOCK_POOL_GAP=100
   mkdir -p "$HOME/.config/agent-kit" "$HOME/.local/share/cloud-runs"
   echo CLOUD_CREDIT_UNTIL=2033-05-20T03:33:20Z >"$HOME/.config/agent-kit/config"
   printf 'time\t72.90\n' >"$HOME/.local/share/cloud-runs/balance.tsv"
@@ -89,6 +90,45 @@ Usage note: prompt cache expired: this turn re-reads ~60k tokens; if the earlier
   log=$HOME/.local/share/usage-log/usage.tsv
   [[ $(head -1 "$log") == $'time\tsession\tclaude_5h\tclaude_week\tcodex_5h\tcodex_week\tcodex_as_of' ]]
   [[ $(tail -1 "$log") == $'2033-05-18T03:33:20+00:00\tabcdefgh\t83\t21\t0\t35\t2033-05-18T03:13:20+00:00' ]]
+}
+# usage_notes C5 C5_RESET WEEK WEEK_RESET CODEX CODEX_RESET: prints the Usage note lines (now = 2000000000)
+usage_notes() {
+  clock_fixture
+  printf '{"rate_limits":{"five_hour":{"used_percentage":%s,"resets_at":%s},"seven_day":{"used_percentage":%s,"resets_at":%s}}}\n' "$1" "$2" "$3" "$4" >"$AGENT_KIT_USAGE_CACHE/claude-statusline.json"
+  printf '{"rate_limits":{"limit_id":"codex","primary":{"used_percent":%s,"resets_at":%s}}}\n' "$5" "$6" >"$CODEX_HOME/sessions/rollout-fixture.jsonl"
+  rm -f "$AGENT_KIT_USAGE_CACHE"/codex*
+  echo '{}' | "$KIT_ROOT/modules/usage/files/prompt-clock" | jq -r .hookSpecificOutput.additionalContext | grep '^Usage note:' || true
+}
+@test "spend-before-reset note fires only under half used and within 30 minutes" {
+  W="0 2000500000"
+  [[ $(usage_notes 49 2000001800 $W 49 2000009999) == 'Usage note: Claude 5h resets within 30 min with over half unused: fine to spend it on a thorough review or an extra pass' ]]
+  [[ -z $(usage_notes 50 2000001800 $W 50 2000009999) ]]
+  [[ -z $(usage_notes 49 2000001801 $W 49 2000009999) ]]
+  [[ -z $(usage_notes 49 2000000000 $W 20 2000009999) ]]
+}
+@test "do-not-start note fires at 75 percent within 45 minutes" {
+  W="0 2000500000"
+  [[ $(usage_notes 75 2000002700 $W 75 2000009999) == "Usage note: Claude 5h is at 75% and resets at 04:18"* ]]
+  [[ $(usage_notes 75 2000002700 $W 75 2000009999) == *"suggest waiting for the reset" ]]
+  [[ -z $(usage_notes 74 2000002700 $W 74 2000009999) ]]
+  [[ -z $(usage_notes 75 2000002701 $W 75 2000009999) ]]
+}
+@test "weekly pace note fires at the margin and not below it" {
+  # week resets in 302400s: 50% of the week gone
+  [[ $(usage_notes 60 2000009999 60 2000302400 60 2000009999) == 'Usage note: Claude week is ahead of pace (60% used, 50% of the week gone): default to Sonnet or Codex even when the 5h window looks fine' ]]
+  [[ -z $(usage_notes 59 2000009999 59 2000302400 59 2000009999) ]]
+  PROMPT_CLOCK_PACE_MARGIN=5 run usage_notes 55 2000009999 55 2000302400 55 2000009999
+  [[ $output == *"ahead of pace (55% used"* ]]
+  [[ -z $(usage_notes 70 2000009999 70 2000604801 70 2000009999) ]]
+}
+@test "emptier pool note names the pool with room and respects the gap" {
+  W="0 2000500000"
+  [[ $(usage_notes 60 2000009999 $W 30 2000009999) == 'Usage note: Codex 5h is well below Claude (30% vs 60%): lean on Codex for implementation' ]]
+  [[ -z $(usage_notes 60 2000009999 $W 31 2000009999) ]]
+  [[ $(usage_notes 30 2000009999 $W 60 2000009999) == 'Usage note: Claude 5h is well below Codex (30% vs 60%): lean on Claude for implementation' ]]
+  [[ -z $(usage_notes 30 2000009999 $W 59 2000009999) ]]
+  PROMPT_CLOCK_POOL_GAP=10 run usage_notes 60 2000009999 $W 49 2000009999
+  [[ $output == *"Codex 5h is well below Claude (49% vs 60%)"* ]]
 }
 @test "header mismatch rotates once and unknown session is empty" {
   clock_fixture

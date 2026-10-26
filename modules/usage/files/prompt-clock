@@ -38,6 +38,31 @@ if [[ -z ${CREW_AGENT:-} ]]; then
   if [[ ${c%.*} =~ ^[0-9]+$ && $cr =~ ^[0-9]+$ ]] && (( ${c%.*} >= ${PROMPT_CLOCK_LOW_AT:-80} && cr-usage_now > 3600 )); then
     line+=$'\nUsage note: Claude 5h is low with over an hour to reset: prefer Sonnet/Codex or medium effort'
   fi
+  cp=$(usage_percent "$c" "$cr"); cwp=$(usage_percent "$cw" "$cwr"); xp=$(usage_percent "$x" "$xr")
+  cp=${cp:--}; cwp=${cwp:--}; xp=${xp:--}
+  if [[ $cp =~ ^[0-9]+$ && $cr =~ ^[0-9]+$ ]] && (( cr-usage_now > 0 )); then
+    left=$(( cr-usage_now ))
+    if (( cp < 50 && left <= 1800 )); then
+      line+=$'\nUsage note: Claude 5h resets within 30 min with over half unused: fine to spend it on a thorough review or an extra pass'
+    fi
+    if (( cp >= 75 && left <= 2700 )); then
+      line+=$'\n'"Usage note: Claude 5h is at $cp% and resets at $(epoch_format "$cr" '%H:%M'): don't start a crew task or multi-file change now; suggest waiting for the reset"
+    fi
+  fi
+  if [[ $cwp =~ ^[0-9]+$ && $cwr =~ ^[0-9]+$ ]] && (( cwr-usage_now > 0 && cwr-usage_now <= 604800 )); then
+    elapsed=$(( 100*(604800-(cwr-usage_now))/604800 ))
+    if (( cwp >= elapsed + ${PROMPT_CLOCK_PACE_MARGIN:-10} )); then
+      line+=$'\n'"Usage note: Claude week is ahead of pace ($cwp% used, $elapsed% of the week gone): default to Sonnet or Codex even when the 5h window looks fine"
+    fi
+  fi
+  if [[ $cp =~ ^[0-9]+$ && $xp =~ ^[0-9]+$ ]]; then
+    gap=${PROMPT_CLOCK_POOL_GAP:-30}
+    if (( cp-xp >= gap )); then
+      line+=$'\n'"Usage note: Codex 5h is well below Claude ($xp% vs $cp%): lean on Codex for implementation"
+    elif (( xp-cp >= gap )); then
+      line+=$'\n'"Usage note: Claude 5h is well below Codex ($cp% vs $xp%): lean on Claude for implementation"
+    fi
+  fi
   read -r csid exp tokens < <(jq -r '[.session_id // "-",.prompt_cache.expires_at // "-",.prompt_cache.recache_tokens_if_cold // "-"]|map(tostring)|join(" ")' <<<"$snapshot")
   if [[ -n $sid && $sid == "$csid" && $exp =~ ^[0-9]+$ && $tokens =~ ^[0-9]+$ ]] && (( exp <= usage_now && tokens >= 50000 )); then
     line+=$'\n'"Usage note: prompt cache expired: this turn re-reads ~$(( tokens/1000 ))k tokens; if the earlier work is finished, suggest /clear or a handoff"
