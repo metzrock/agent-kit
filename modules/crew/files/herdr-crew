@@ -4,7 +4,7 @@
 # Opus). One task at a time per Herdr workspace; each task gets its own git
 # worktree and branch.
 #
-#   herdr-crew task [--cloud] <slug>  new Herdr worktree workspace on branch crew/<slug>, agents in it;
+#   herdr-crew task [--cloud] [--lane quick|full] [--anyway] <slug>  new Herdr worktree workspace on branch crew/<slug>, agents in it;
 #                                     --cloud: the cloud lane (no local agents; every job below
 #                                     runs as a Claude Code cloud session, via cloud-run)
 #   herdr-crew scout [--by sonnet|codex] [--model M] [--effort E] <brief>
@@ -17,12 +17,13 @@
 #   herdr-crew review [--by sonnet|codex|cloud]
 #                                     review with CREW_HELPER (default Sonnet), a fresh Codex
 #                                     agent at high effort, or a fresh cloud session
-#   herdr-crew fix [--by sonnet|cloud] <findings.md>
+#   herdr-crew fix [--by sonnet|cloud] [--over-limit "<reason>"] <findings.md>
 #                                     hand review findings back to the implementer and wait
 #   herdr-crew merge                  retry merging part B into the task worktree
 #   herdr-crew diff [git-diff-args]   git diff of the task against its base (incl. untracked)
 #   herdr-crew commit <message>       commit everything in the task worktree
 #   herdr-crew finish                 stop the agents and end the task (branch + workspace kept)
+#   herdr-crew lane quick|full        change the active task’s fix-round budget
 #   herdr-crew status                 task, agents, and diff stat
 #   herdr-crew up | down              start / close the agents without touching the task
 #   herdr-crew read <name> [lines]    dump an agent's recent terminal output
@@ -100,6 +101,7 @@ TASK_FILE=$STATE_DIR/task.env
 
 # Task state: WORKTREE BRANCH BASE REPO RUN, the task's Herdr workspace and root pane, and
 # for the cloud lane the implementing cloud session (fix rounds go back to it).
+TASK_LANE=full LEAD_SESSION_ID=""
 WORKTREE="" BRANCH="" BASE="" REPO="" RUN="" TASK_WS="" TASK_PANE="" LANE="" CLOUD_SESSION="" CLOUD_URL=""
 # shellcheck disable=SC1090
 [ -f "$TASK_FILE" ] && . "$TASK_FILE"
@@ -324,8 +326,8 @@ cmd_down() {
 }
 
 save_task() {
-  printf 'WORKTREE=%q\nBRANCH=%q\nBASE=%q\nREPO=%q\nRUN=%q\nTASK_WS=%q\nTASK_PANE=%q\nLANE=%q\nCLOUD_SESSION=%q\nCLOUD_URL=%q\n' \
-    "$WORKTREE" "$BRANCH" "$BASE" "$REPO" "$RUN" "$TASK_WS" "$TASK_PANE" "$LANE" "$CLOUD_SESSION" "$CLOUD_URL" >"$TASK_FILE"
+  printf 'WORKTREE=%q\nBRANCH=%q\nBASE=%q\nREPO=%q\nRUN=%q\nTASK_WS=%q\nTASK_PANE=%q\nLANE=%q\nCLOUD_SESSION=%q\nCLOUD_URL=%q\nTASK_LANE=%q\nLEAD_SESSION_ID=%q\n' \
+    "$WORKTREE" "$BRANCH" "$BASE" "$REPO" "$RUN" "$TASK_WS" "$TASK_PANE" "$LANE" "$CLOUD_SESSION" "$CLOUD_URL" "$TASK_LANE" "$LEAD_SESSION_ID" >"$TASK_FILE"
 }
 
 task_usage_snapshot() {
@@ -333,12 +335,48 @@ task_usage_snapshot() {
     "${XDG_CACHE_HOME:-$HOME/.cache}/agent-kit-usage/claude-statusline.json" 2>/dev/null || printf '%s\t%s\n' - -
 }
 
+usage_at_limit() {
+  [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  jq -en --argjson used "$1" --argjson limit "$2" '$used >= $limit' >/dev/null
+}
+
+cmd_lane() {
+  need_task
+  [[ $# == 1 && ( $1 == quick || $1 == full ) ]] || die "usage: herdr-crew lane quick|full"
+  TASK_LANE=$1; save_task
+  echo "task lane: $TASK_LANE"
+}
+
 cmd_task() {
-  local lane=local
-  if [ "${1:-}" = --cloud ]; then lane=cloud; shift; fi
+  local lane=local task_lane=full anyway=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cloud) lane=cloud; shift ;;
+      --lane) task_lane=${2:?--lane takes quick or full}; shift 2 ;;
+      --anyway) anyway=1; shift ;;
+      *) break ;;
+    esac
+  done
+  case "$task_lane" in quick|full) ;; *) die "--lane takes quick or full" ;; esac
   local slug=${1:-}
-  [[ $slug =~ ^[a-z0-9][a-z0-9._-]{0,40}$ ]] || die "usage: herdr-crew task [--cloud] <slug>  (lowercase, digits, . _ -)"
+  [[ $slug =~ ^[a-z0-9][a-z0-9._-]{0,40}$ ]] || die "usage: herdr-crew task [--cloud] [--lane quick|full] [--anyway] <slug>  (lowercase, digits, . _ -)"
   [ -z "$WORKTREE" ] || die "task $BRANCH is still active in $WORKTREE; run 'herdr-crew finish' first"
+  [ $# -eq 1 ] || die "task takes one slug"
+  local snapshot used reset codex limit=${CREW_START_LIMIT:-80}
+  snapshot=$(task_usage_snapshot)
+  IFS=$'\t' read -r used reset <<<"$snapshot"
+  if [[ $anyway == 0 ]] && usage_at_limit "$used" "$limit"; then
+    die "Claude 5h usage is $used% (reset: $reset); wait for reset or pass --anyway"
+  fi
+  if command -v usage-status >/dev/null; then
+    codex=$(usage-status 2>/dev/null || true)
+    if [[ $codex =~ Codex[[:space:]]+([0-9]+([.][0-9]+)?)% ]]; then
+      codex=${BASH_REMATCH[1]}
+      if usage_at_limit "$codex" "$limit"; then
+        echo "warning: Codex 5h usage is $codex%; reading may be old" >&2
+      fi
+    fi
+  fi
   local repo; repo=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
   git -C "$repo" rev-parse --verify -q HEAD >/dev/null || die "repository has no commits yet"
   git -C "$repo" show-ref --verify -q "refs/heads/crew/$slug" && die "branch crew/$slug already exists"
@@ -364,9 +402,9 @@ cmd_task() {
     --path "$WORKTREE" --label "crew: $slug" --no-focus) || die "herdr worktree create failed"
   TASK_WS=$(jq -r '.result.workspace.workspace_id' <<<"$created")
   TASK_PANE=$(jq -r '.result.root_pane.pane_id' <<<"$created")
-  LANE=$lane CLOUD_SESSION="" CLOUD_URL=""
+  LANE=$lane TASK_LANE=$task_lane LEAD_SESSION_ID=${CLAUDE_CODE_SESSION_ID:-} CLOUD_SESSION="" CLOUD_URL=""
   save_task
-  task_usage_snapshot >"$RUN/usage-start.tsv"
+  printf '%s\n' "$snapshot" >"$RUN/usage-start.tsv"
   step "starting"
   cmd_up
   step "ready"
@@ -524,14 +562,29 @@ cmd_merge() {
 
 cmd_fix() {
   need_task
-  local agent=$IMPL by=$CREW_IMPLEMENTER
-  if [ "${1:-}" = --by ]; then by=${2:-}; shift 2 || true; fi
+  local agent=$IMPL by=$CREW_IMPLEMENTER reason=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by) by=${2:?--by takes an implementer}; shift 2 ;;
+      --over-limit) reason=${2:?--over-limit needs a reason}; shift 2 ;;
+      *) break ;;
+    esac
+  done
   cloud_on && by=cloud
   case "$by" in codex) ;; sonnet) [[ $CREW_IMPLEMENTER == sonnet ]] || agent=$SONNET ;; cloud) ;; *) die "--by takes codex, sonnet or cloud" ;; esac
   [[ $by != codex || $CREW_IMPLEMENTER == codex ]] || die 'Set CREW_IMPLEMENTER=codex to use a Codex implementer'
   [[ $by != sonnet ]] || allow_sonnet
-  local findings=${1:-}; [ -f "$findings" ] || die "usage: herdr-crew fix [--by sonnet|cloud] <findings.md>"
+  local findings=${1:-}; [ -f "$findings" ] || die "usage: herdr-crew fix [--by sonnet|cloud] [--over-limit \"<reason>\"] <findings.md>"
   local n=1; while [ -e "$RUN/fix-$n.md" ] || [ -e "$RUN/findings-$n.md" ]; do n=$((n + 1)); done
+  local limit=${CREW_FIX_LIMIT_FULL:-2}
+  [[ $TASK_LANE != quick ]] || limit=${CREW_FIX_LIMIT_QUICK:-1}
+  [[ $limit =~ ^[0-9]+$ ]] || die "fix-round limit must be a non-negative integer"
+  if (( n > 10#$limit )); then
+    [[ -n ${reason//[[:space:]]/} ]] || die "$TASK_LANE lane limit is $limit fix rounds; use --over-limit \"<reason>\" to proceed"
+    [[ $reason != *$'\n'* && $reason != *$'\r'* ]] || die "--over-limit reason must be one line"
+    printf 'round %s: %s\n' "$n" "$reason" >>"$RUN/over-limit.txt"
+    printf 'over limit: %s\n' "$reason"
+  fi
   cp "$findings" "$RUN/findings-$n.md"
   if [ "$by" = cloud ]; then
     to_cloud
@@ -686,6 +739,80 @@ cmd_commit() {
   git -C "$WORKTREE" log -1 --format='committed %h on %D: %s'
 }
 
+# Only usage counters leave transcripts; content and cached reads are excluded.
+lead_tokens() { # <start epoch> <end epoch>
+  local file value total=0 found=0
+  [[ -n $LEAD_SESSION_ID && -d $HOME/.claude/projects ]] || { echo -; return; }
+  while IFS= read -r -d '' file; do
+    value=$(jq -s --argjson start "$1" --argjson end "$2" '
+      [.[] | select(.type == "assistant") |
+        select((.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $t |
+          $t >= $start and $t <= $end) |
+        select(.message.id != null)] | unique_by(.message.id) |
+      map((.message.usage.input_tokens // 0) +
+          (.message.usage.cache_creation_input_tokens // 0) +
+          (.message.usage.output_tokens // 0)) | add // 0' "$file") || return 1
+    total=$((total + value)); found=1
+  done < <(find "$HOME/.claude/projects" -type f -name "$LEAD_SESSION_ID.jsonl" -newer "$RUN/usage-start.tsv" -print0)
+  if ((found)); then echo "$total"; else echo -; fi
+}
+
+codex_tokens() { # <end epoch>
+  local sessions=${CODEX_HOME:-$HOME/.codex}/sessions file value total=0 found=0
+  [[ -d $sessions ]] || { echo -; return; }
+  while IFS= read -r -d '' file; do
+    # Reject other worktrees before reading their remaining events.
+    head -1 "$file" | jq -e --arg a "$WORKTREE" --arg b "$WORKTREE_B" \
+      '.payload.cwd == $a or .payload.cwd == $b' >/dev/null || continue
+    value=$(jq -s '[.[] | select(.type == "event_msg" and .payload.type == "token_count") |
+      .payload.info.total_token_usage | select(. != null)] | last |
+      if . == null then "-" else
+        (.input_tokens // 0) - (.cached_input_tokens // 0) + (.output_tokens // 0) end' "$file") || return 1
+    [[ $value != '"-"' ]] || continue
+    total=$((total + value)); found=1
+  done < <(find "$sessions" -type f -name '*.jsonl' -newer "$RUN/usage-start.tsv" ! -newermt "@$1" -print0)
+  if ((found)); then echo "$total"; else echo -; fi
+}
+
+crew_log() {
+  local log=${XDG_STATE_HOME:-$HOME/.local/state}/herdr-crew/crew-log.tsv
+  local start end finished minutes lead codex used_start used_end reset
+  local scout=0 part_b=0 reviews=0 fixes=0 over=0 must=0 file line lock_fd
+  local must_heading='^[#*0-9.)[:space:]-]*MUST-FIX'
+  start=$(stat -c %Y "$RUN/usage-start.tsv") || return 1
+  end=$(date +%s) || return 1
+  finished=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
+  minutes=$(( (end - start) / 60 ))
+  IFS=$'\t' read -r used_start reset <"$RUN/usage-start.tsv" || return 1
+  IFS=$'\t' read -r used_end reset <<<"$(task_usage_snapshot)"
+  for file in "$RUN"/scout*.md; do [[ ! -f $file ]] || scout=1; done
+  [[ ! -f $RUN/spec-b.md ]] || part_b=1
+  for file in "$RUN"/review-*.md; do
+    [[ -f $file ]] || continue
+    reviews=$((reviews + 1))
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ ${line^^} =~ $must_heading ]]; then must=$((must + 1)); fi
+    done <"$file"
+  done
+  for file in "$RUN"/findings-*.md; do [[ ! -f $file ]] || fixes=$((fixes + 1)); done
+  if [[ -f $RUN/over-limit.txt ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do over=$((over + 1)); done <"$RUN/over-limit.txt"
+  fi
+  lead=$(lead_tokens "$start" "$end") || return 1
+  codex=$(codex_tokens "$((end + 1))") || return 1
+  mkdir -p "${log%/*}" || return 1
+  # Finish runs this in a subshell, which releases the lock on return.
+  exec {lock_fd}>"$log.lock" || return 1
+  flock -x "$lock_fd" || return 1
+  if [[ ! -e $log ]]; then
+    printf 'finished_at\trepo\tslug\tlane\twhere\tscout\tpart_b\treviews\tfix_rounds\tover_limit_rounds\tmust_fix\tminutes\tclaude_5h_start\tclaude_5h_end\tlead_tokens\tcodex_tokens\n' >"$log" || return 1
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$finished" "$(basename "$REPO")" "${BRANCH#crew/}" "$TASK_LANE" "${LANE:-local}" \
+    "$scout" "$part_b" "$reviews" "$fixes" "$over" "$must" "$minutes" \
+    "$used_start" "$used_end" "$lead" "$codex" >>"$log" || return 1
+}
+
 cmd_finish() {
   need_task
   [ -z "$(git -C "$WORKTREE" status --porcelain)" ] || die "uncommitted changes in $WORKTREE; commit them first"
@@ -697,6 +824,9 @@ cmd_finish() {
     local usage_log=${XDG_DATA_HOME:-$HOME/.local/share}/usage-log/tasks.tsv
     mkdir -p "${usage_log%/*}"
     printf '%s\t%s\n' "$(cat "$RUN/usage-start.tsv")" "$(task_usage_snapshot)" >>"$usage_log"
+  fi
+  if ! (crew_log) 2>/dev/null; then
+    echo "note: could not write crew-log.tsv; task finish continues" >&2
   fi
   rm -f "$TASK_FILE"
   cat <<EOF
@@ -791,7 +921,8 @@ cmd_status() {
   if [ -n "$WORKTREE" ]; then
     printf 'task:     %s\nworktree: %s\nbase:     %s\nreports:  %s\nworkspace: %s\n' "$BRANCH" "$WORKTREE" "${BASE:0:12}" "$RUN" "${TASK_WS:-none}"
     [ -d "$WORKTREE_B" ] && printf 'part B:   %s (not merged yet)\n' "$WORKTREE_B"
-    cloud_on && printf 'lane:     cloud%s\n' "${CLOUD_URL:+ (implementer: $CLOUD_URL)}"
+    printf 'task lane: %s\n' "$TASK_LANE"
+    cloud_on && printf 'where:    cloud%s\n' "${CLOUD_URL:+ (implementer: $CLOUD_URL)}"
     show_untracked 2>/dev/null || true
     git -C "$WORKTREE" diff --stat "$BASE" 2>/dev/null | tail -1 | sed 's/^/diff:    /' || true
   else
@@ -816,6 +947,7 @@ cmd_read() {
 sub=${1:-}; shift || true
 case "$sub" in
   task) cmd_task "$@" ;;
+  lane) cmd_lane "$@" ;;
   up) cmd_up ;;
   down) cmd_down ;;
   scout) cmd_scout "$@" ;;

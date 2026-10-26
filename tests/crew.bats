@@ -214,3 +214,229 @@ MOCK
   [[ $status == 0 && -s $HOME/state/scout-haiku.md ]]
   grep -q 'agent start sonnet --kind claude.*--model claude-haiku-5-5 --effort high' "$HOME/commands"
 }
+
+
+@test "full fix limit rejects round three and records an explicit override" {
+  codex_crew
+  touch "$HOME/live-implementer" "$HOME/state/findings-1.md" "$HOME/state/fix-2.md"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" fix "$HOME/spec.md"
+  [[ $status == 1 && $output == *'full lane limit is 2'* && $output == *'--over-limit'* ]]
+  [[ ! -e $HOME/state/findings-3.md ]]
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" fix --over-limit 'security fix remains' --by codex "$HOME/spec.md"
+  [[ $status == 0 && $output == *'security fix remains'* ]]
+  [[ $(cat "$HOME/state/over-limit.txt") == 'round 3: security fix remains' ]]
+  [[ -f $HOME/state/findings-3.md ]]
+}
+
+@test "quick limit is one and lane changes persist with configurable limits" {
+  codex_crew
+  touch "$HOME/live-implementer"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" status
+  [[ $status == 0 && $output == *'task lane: full'* ]]
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" lane quick
+  [[ $status == 0 ]]
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" fix "$HOME/spec.md"
+  [[ $status == 0 ]]
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" fix "$HOME/spec.md"
+  [[ $status == 1 && $output == *'quick lane limit is 1'* ]]
+  run env CREW_FIX_LIMIT_QUICK=2 "$KIT_ROOT/modules/crew/files/herdr-crew" fix "$HOME/spec.md"
+  [[ $status == 0 ]]
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" lane full
+  [[ $status == 0 ]]
+  run env CREW_FIX_LIMIT_FULL=3 "$KIT_ROOT/modules/crew/files/herdr-crew" fix "$HOME/spec.md"
+  [[ $status == 0 ]]
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" lane invalid
+  [[ $status == 1 ]]
+}
+
+@test "cloud fixes enforce the limit before sending a job" {
+  codex_crew
+  printf 'LANE=cloud\nTASK_LANE=quick\n' >>"$HOME/state/task.env"
+  touch "$HOME/state/findings-1.md"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" fix "$HOME/spec.md"
+  [[ $status == 1 && $output == *'quick lane limit is 1'* ]]
+  [[ ! -e $HOME/commands ]]
+  # Deliberately fail at cloud_put, after the shared override gate.
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" fix --over-limit 'cloud follow-up' "$HOME/spec.md"
+  [[ $output == *'over limit: cloud follow-up'* ]]
+  [[ $(cat "$HOME/state/over-limit.txt") == 'round 2: cloud follow-up' ]]
+}
+
+task_start_crew() {
+  codex_crew
+  rm "$HOME/state/task.env"
+  export CREW_WORKTREE_ROOT="$HOME/worktrees" XDG_CACHE_HOME="$HOME/cache"
+  mkdir -p "$HOME/repo" "$XDG_CACHE_HOME/agent-kit-usage"
+  git -C "$HOME/repo" init -q
+  git -C "$HOME/repo" -c user.name=Test -c user.email=noreply@example.com commit -q --allow-empty -m initial
+  cd "$HOME/repo"
+  # Return a workspace and create the actual checkout, as Herdr would.
+  sed -i "/case \"\$1 \$2\" in/a\\
+  'worktree create') git -C \"\$4\" worktree add -q -b \"\$6\" \"\${10}\" \"\$8\"; echo '{\"result\":{\"workspace\":{\"workspace_id\":\"task\"},\"root_pane\":{\"pane_id\":\"root\"}}}';;" "$HOME/mock/herdr"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$HOME/mock/usage-status"
+  chmod +x "$HOME/mock/usage-status"
+}
+
+@test "task blocks high Claude before creating worktree and anyway preserves lane and session" {
+  task_start_crew
+  printf '{"rate_limits":{"five_hour":{"used_percentage":80,"resets_at":"tomorrow"}}}' >"$XDG_CACHE_HOME/agent-kit-usage/claude-statusline.json"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" task --lane quick sample
+  [[ $status == 1 && $output == *'80%'* && $output == *'tomorrow'* && $output == *'--anyway'* ]]
+  [[ ! -e $HOME/commands && ! -e $HOME/worktrees ]]
+  run env CLAUDE_CODE_SESSION_ID=lead-session "$KIT_ROOT/modules/crew/files/herdr-crew" task --anyway --lane quick sample
+  [[ $status == 0 ]]
+  grep -q '^TASK_LANE=quick$' "$HOME/state/task.env"
+  grep -q '^LEAD_SESSION_ID=lead-session$' "$HOME/state/task.env"
+}
+
+@test "unknown Claude never blocks and high Codex only warns" {
+  task_start_crew
+  printf '#!/usr/bin/env bash\necho "Claude 12%% · Codex 95%% ↻12:00"\n' >"$HOME/mock/usage-status"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" task sample
+  [[ $status == 0 && $output == *'warning: Codex 5h usage is 95%'* ]]
+  grep -q '^TASK_LANE=full$' "$HOME/state/task.env"
+  [[ $(cat "$HOME/state"/runs/*/usage-start.tsv) == $'-\t-' ]]
+}
+
+@test "start threshold is configurable and unexpected usage-status is harmless" {
+  task_start_crew
+  printf '{"rate_limits":{"five_hour":{"used_percentage":79.5}}}' >"$XDG_CACHE_HOME/agent-kit-usage/claude-statusline.json"
+  run env CREW_START_LIMIT=70 "$KIT_ROOT/modules/crew/files/herdr-crew" task sample
+  [[ $status == 1 && $output == *'79.5%'* ]]
+  printf '#!/usr/bin/env bash\necho unexpected; exit 1\n' >"$HOME/mock/usage-status"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" task sample
+  [[ $status == 0 ]]
+}
+
+finish_crew() {
+  codex_crew
+  export XDG_STATE_HOME="$HOME/log-state" XDG_DATA_HOME="$HOME/data" XDG_CACHE_HOME="$HOME/cache"
+  git -C "$HOME/task" init -q
+  git -C "$HOME/task" -c user.name=Test -c user.email=noreply@example.com commit -q --allow-empty -m initial
+  git -C "$HOME/task" branch -f crew/sample
+  printf 'REPO=%q\nBRANCH=crew/sample\nTASK_LANE=quick\nLANE=local\nLEAD_SESSION_ID=lead-session\n' "$HOME/task" >>"$HOME/state/task.env"
+  printf '12\t-\n' >"$HOME/state/usage-start.tsv"
+  touch -d '10 minutes ago' "$HOME/state/usage-start.tsv"
+}
+
+@test "finish logs counts and deduplicated uncached transcript usage" {
+  finish_crew
+  touch "$HOME/state/scout.md" "$HOME/state/spec-b.md" "$HOME/state/findings-1.md" "$HOME/state/findings-2.md"
+  printf 'MUST-FIX twice MUST-FIX\n## must-fix\n  - **MUST-FIX**: issue\n  2.) must-fix: issue\nno MUST-FIX findings\nFix every MUST-FIX\n' >"$HOME/state/review-1.md"
+  echo approved >"$HOME/state/review-2.md"
+  printf 'round 2: reason\n' >"$HOME/state/over-limit.txt"
+  mkdir -p "$HOME/.claude/projects/project" "$HOME/custom-codex/sessions/2026/01/01" "$XDG_CACHE_HOME/agent-kit-usage"
+  export CODEX_HOME="$HOME/custom-codex"
+  printf '{"rate_limits":{"five_hour":{"used_percentage":24}}}' >"$XDG_CACHE_HOME/agent-kit-usage/claude-statusline.json"
+  now=$(date -u +%Y-%m-%dT%H:%M:%S.123Z)
+  jq -cn --arg t "$now" '{type:"assistant",timestamp:$t,message:{id:"one",usage:{input_tokens:10,cache_creation_input_tokens:20,cache_read_input_tokens:999,output_tokens:3}}}' >"$HOME/.claude/projects/project/lead-session.jsonl"
+  cat "$HOME/.claude/projects/project/lead-session.jsonl" >>"$HOME/duplicate"
+  cat "$HOME/duplicate" >>"$HOME/.claude/projects/project/lead-session.jsonl"
+  printf '%s\n' '{"type":"assistant","timestamp":"2000-01-01T00:00:00Z","message":{"id":"old","usage":{"input_tokens":999}}}' >>"$HOME/.claude/projects/project/lead-session.jsonl"
+  printf '%s\n' '{"type":"assistant","timestamp":"2999-01-01T00:00:00Z","message":{"id":"future","usage":{"input_tokens":999}}}' '{"type":"user","message":{"content":"private text"}}' >>"$HOME/.claude/projects/project/lead-session.jsonl"
+  for target in task task-b other; do
+    jq -cn --arg cwd "$HOME/$target" '{payload:{cwd:$cwd}}' >"$CODEX_HOME/sessions/2026/01/01/$target.jsonl"
+    printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":5}}}}' '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":100,"output_tokens":10}}}}' >>"$CODEX_HOME/sessions/2026/01/01/$target.jsonl"
+  done
+  cp "$CODEX_HOME/sessions/2026/01/01/task.jsonl" "$CODEX_HOME/sessions/2026/01/01/stale.jsonl"
+  touch -d '1 hour ago' "$CODEX_HOME/sessions/2026/01/01/stale.jsonl"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" finish
+  [[ $status == 0 && ! -e $HOME/state/task.env ]]
+  log="$XDG_STATE_HOME/herdr-crew/crew-log.tsv"
+  [[ $(wc -l <"$log") == 2 ]]
+  awk -F '\t' 'NR==1 {if (NF!=16 || $16!="codex_tokens") exit 1} NR==2 {if (NF!=16 || $2!="task" || $3!="sample" || $4!="quick" || $5!="local" || $6!=1 || $7!=1 || $8!=2 || $9!=2 || $10!=1 || $11!=4 || $12!=10 || $13!=12 || $14!=24 || $15!=33 || $16!=220) exit 1}' "$log"
+}
+
+@test "finish logs unknown tokens and appends without another header" {
+  finish_crew
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" finish
+  [[ $status == 0 ]]
+  awk -F '\t' 'NR==2 {if ($15!="-" || $16!="-" || $6!=0 || $7!=0 || $8!=0) exit 1}' "$XDG_STATE_HOME/herdr-crew/crew-log.tsv"
+  finish_crew
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" finish
+  [[ $status == 0 ]]
+  [[ $(wc -l <"$XDG_STATE_HOME/herdr-crew/crew-log.tsv") == 3 ]]
+}
+
+@test "finish still succeeds when crew log cannot be written" {
+  finish_crew
+  mkdir -p "$XDG_STATE_HOME/herdr-crew/crew-log.tsv"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" finish
+  [[ $status == 0 && $output == *'note: could not write crew-log.tsv'* && $output == *'Task finished.'* ]]
+  [[ ! -e $HOME/state/task.env ]]
+}
+
+
+@test "cloud and task lane flags work in either order" {
+  task_start_crew
+  git remote add origin https://github.com/example/project.git
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$HOME/mock/cloud-run"
+  chmod +x "$HOME/mock/cloud-run"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" task --cloud --lane full first
+  [[ $status == 0 ]]
+  grep -q '^LANE=cloud$' "$HOME/state/task.env"
+  grep -q '^TASK_LANE=full$' "$HOME/state/task.env"
+  rm "$HOME/state/task.env"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" task --lane quick --cloud second
+  [[ $status == 0 ]]
+  grep -q '^LANE=cloud$' "$HOME/state/task.env"
+  grep -q '^TASK_LANE=quick$' "$HOME/state/task.env"
+}
+
+@test "malformed transcripts cannot interrupt finish" {
+  finish_crew
+  mkdir -p "$HOME/.claude/projects/project"
+  echo invalid >"$HOME/.claude/projects/project/lead-session.jsonl"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" finish
+  [[ $status == 0 && $output == *'note: could not write crew-log.tsv'* ]]
+  [[ ! -e $HOME/state/task.env ]]
+}
+
+
+@test "concurrent first finishes keep one header and both task rows" {
+  finish_crew
+  cp -a "$HOME/state" "$HOME/state-b"
+  printf 'RUN=%q\nBRANCH=crew/second\n' "$HOME/state-b" >>"$HOME/state-b/task.env"
+  git -C "$HOME/task" branch crew/second
+  export CREW_TEST_FLOCK
+  CREW_TEST_FLOCK=$(command -v flock)
+  mkdir -p "$XDG_STATE_HOME/herdr-crew"
+  mkfifo "$HOME/lock-ready"
+  exec 8<>"$HOME/lock-ready"
+  exec 9>"$XDG_STATE_HOME/herdr-crew/crew-log.tsv.lock"
+  "$CREW_TEST_FLOCK" -x 9
+  cat >"$HOME/mock/flock" <<'MOCK'
+#!/usr/bin/env bash
+printf 'ready\n' >"$HOME/lock-ready"
+exec "$CREW_TEST_FLOCK" "$@"
+MOCK
+  chmod +x "$HOME/mock/flock"
+  "$KIT_ROOT/modules/crew/files/herdr-crew" finish 8>&- 9>&- >"$HOME/finish-a.out" 2>&1 &
+  first=$!
+  CREW_STATE_DIR="$HOME/state-b" "$KIT_ROOT/modules/crew/files/herdr-crew" finish 8>&- 9>&- >"$HOME/finish-b.out" 2>&1 &
+  second=$!
+  # Both finishes must reach the lock while the log is still new.
+  read -r -t 10 -u 8 ready
+  read -r -t 10 -u 8 ready
+  [[ ! -e $XDG_STATE_HOME/herdr-crew/crew-log.tsv ]]
+  "$CREW_TEST_FLOCK" -u 9
+  exec 9>&- 8>&-
+  wait "$first"
+  wait "$second"
+  [[ ! -e $HOME/state/task.env && ! -e $HOME/state-b/task.env ]]
+  ! grep -q 'could not write crew-log' "$HOME/finish-a.out" "$HOME/finish-b.out"
+  awk -F '\t' '
+    NR==1 {if (NF!=16 || $1!="finished_at") exit 1; next}
+    {if (NF!=16 || $1=="finished_at") exit 1; slugs[$3]++}
+    END {if (NR!=3 || slugs["sample"]!=1 || slugs["second"]!=1) exit 1}
+  ' "$XDG_STATE_HOME/herdr-crew/crew-log.tsv"
+}
+
+@test "lock failure still allows finish to succeed" {
+  finish_crew
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$HOME/mock/flock"
+  chmod +x "$HOME/mock/flock"
+  run "$KIT_ROOT/modules/crew/files/herdr-crew" finish
+  [[ $status == 0 && $output == *'note: could not write crew-log.tsv'* ]]
+  [[ ! -e $HOME/state/task.env && ! -e $XDG_STATE_HOME/herdr-crew/crew-log.tsv ]]
+}

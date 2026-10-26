@@ -35,10 +35,8 @@ The helper scouts and reviews; Sonnet codes only when selected as implementer or
 Keep Codex effort at medium unless the task warrants high; never above high.
 Write complete specs and batch accepted findings into one fix round.
 
-Before starting, check the prompt's usage context, or run `usage-status` if absent.
-At 80% or more on either required provider, explain and suggest waiting for reset
-rather than starting a task likely to stop halfway. Codex readings update only
-while Codex runs; an old `[as of HH:MM]` reading may understate current usage.
+The script checks Claude 5h usage at task start and blocks at 80%; wait for reset
+or explicitly pass `--anyway`. High Codex usage only warns because readings may be old.
 During work, watch `Usage update:` threshold messages. Switching Codex models does
 not restore a shared exhausted allowance.
 
@@ -58,7 +56,7 @@ State the lane and implementer count, with a short reason.
 
 ## Nine-step loop
 
-1. Start inside the repository: `herdr-crew task <slug>`. It creates the task
+1. Start inside the repository: `herdr-crew task --lane quick|full <slug>`. It creates the task
    worktree and starts agents. Existing uncommitted checkout changes are excluded;
    tell the user if the script reports them.
 2. Scout when required: write a brief and run `herdr-crew scout <brief.md>`.
@@ -83,15 +81,17 @@ State the lane and implementer count, with a short reason.
    concrete failure scenario. Decide from that evidence; explain rejected findings.
 7. If MUST-FIX findings remain, batch accepted findings and expected behavior into
    one file; run `herdr-crew fix <findings>` in the background, then review again.
-   Later reviews verify earlier fixes. Respect the lane's fix-round limit and
-   report anything left open rather than silently accepting a known defect.
+   Later reviews verify earlier fixes. The script enforces one quick or two full
+   fix rounds. Use `herdr-crew lane full` to upgrade a growing task, or explicitly
+   pass `--over-limit "<reason>"`; include that reason and open items in the final report.
 8. Commit on the task branch with `herdr-crew commit "<type>: <summary>"`, then
    `herdr-crew finish`. This closes agents and marks `✓ ready to merge` while
    keeping the worktree available. Local crew commits autonomously; never push or
    merge. The user chooses when to merge and delete the worktree.
 9. Report branch and commit, changes, implementer count and model, exact checks
    and results from review, accepted/rejected findings and reasons, assumptions,
-   open items, and the merge command printed by `finish`.
+   open items, the `crew-log.tsv` path under the herdr-crew state directory,
+   and the merge command printed by `finish`.
 
 Run long scout, implement, review, and fix commands with `run_in_background: true`
 when the tool supports it; wait for completion notification instead of polling.
